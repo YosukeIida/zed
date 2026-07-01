@@ -81,6 +81,11 @@
               ];
             };
             PROTOC = "${pkgs.protobuf}/bin/protoc";
+          }
+          # The musl cross-toolchain is only needed to build the Linux
+          # `remote_server`. On macOS it forces an expensive from-source build of
+          # an x86_64-linux-musl GCC that we never use, so gate it to Linux.
+          // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
             ZED_ZSTD_MUSL_LIB = "${pkgs.pkgsCross.musl64.pkgsStatic.zstd.out}/lib";
             # For aws-lc-sys musl cross-compilation
             CC_x86_64_unknown_linux_musl = "${muslCross.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc";
