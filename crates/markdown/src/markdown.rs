@@ -1,4 +1,5 @@
 pub mod html;
+mod math;
 mod mermaid;
 pub mod parser;
 mod path_range;
@@ -11,6 +12,7 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
+use math::{MathBlock, MathBoundsSlot, MathInline, MathState, render_math_block, render_math_inline};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
@@ -21,6 +23,7 @@ use theme_settings::ThemeSettings;
 use util::maybe;
 
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::mem;
 use std::ops::Range;
@@ -42,7 +45,7 @@ use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
 use parser::{
     MarkdownEvent, MarkdownTag, MarkdownTagEnd, ParsedMetadataBlock, parse_links_only,
-    parse_markdown_with_options,
+    parse_markdown_inner,
 };
 use pulldown_cmark::{Alignment, BlockQuoteKind};
 use sum_tree::TreeMap;
@@ -393,6 +396,7 @@ pub struct Markdown {
     fallback_code_block_language: Option<LanguageName>,
     options: MarkdownOptions,
     mermaid_state: MermaidState,
+    math_state: MathState,
     _mermaid_theme_subscription: Option<Subscription>,
     mermaid_showing_code: HashSet<usize>,
     copied_code_blocks: HashSet<ElementId>,
@@ -410,6 +414,7 @@ pub struct MarkdownOptions {
     pub parse_links_only: bool,
     pub parse_html: bool,
     pub render_mermaid_diagrams: bool,
+    pub render_math: bool,
     pub parse_heading_slugs: bool,
     pub render_metadata_blocks: bool,
 }
@@ -561,10 +566,11 @@ impl Markdown {
     ) -> Self {
         let focus_handle = cx.focus_handle();
 
-        let theme_subscription = if options.render_mermaid_diagrams {
+        let theme_subscription = if options.render_mermaid_diagrams || options.render_math {
             Some(
                 cx.observe_global::<theme::GlobalTheme>(|this: &mut Self, cx| {
                     this.invalidate_mermaid_cache(cx);
+                    this.invalidate_math_cache(cx);
                 }),
             )
         } else {
@@ -586,6 +592,7 @@ impl Markdown {
             fallback_code_block_language,
             options,
             mermaid_state: MermaidState::default(),
+            math_state: MathState::default(),
             _mermaid_theme_subscription: theme_subscription,
             mermaid_showing_code: HashSet::default(),
             copied_code_blocks: HashSet::default(),
@@ -646,6 +653,17 @@ impl Markdown {
 
         self.mermaid_state.clear();
         self.mermaid_state.update(&self.parsed_markdown, cx);
+        cx.notify();
+    }
+
+    pub fn invalidate_math_cache(&mut self, cx: &mut Context<Self>) {
+        if !self.options.render_math {
+            return;
+        }
+        // The parsed math `DisplayList` is theme-independent — color is resolved from the theme at
+        // paint time (see `resolve_math_color`) — so a theme change only needs a repaint, not a
+        // re-parse. Mermaid differs (it bakes color into a rasterized image) and is invalidated
+        // separately.
         cx.notify();
     }
 
@@ -861,7 +879,9 @@ impl Markdown {
         if self.selection.end <= self.selection.start {
             return;
         }
-        let text = text.text_for_range(self.selection.start..self.selection.end);
+        let range =
+            text.expand_range_for_atomic_regions(self.selection.start..self.selection.end);
+        let text = text.text_for_range(range);
         cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
@@ -883,6 +903,10 @@ impl Markdown {
         rendered_text: Option<&RenderedText>,
     ) {
         let range = self.selection.start..self.selection.end;
+        // Math is atomic for copy: widen a partial range to fully cover any formula it touches.
+        let range = rendered_text
+            .map(|text| text.expand_range_for_atomic_regions(range.clone()))
+            .unwrap_or(range);
         if range.end > range.start {
             self.context_menu_selected_markdown =
                 Some(SharedString::new(&self.source[range.clone()]));
@@ -945,6 +969,7 @@ impl Markdown {
         let should_parse_links_only = self.options.parse_links_only;
         let should_parse_html = self.options.parse_html;
         let should_render_mermaid_diagrams = self.options.render_mermaid_diagrams;
+        let should_render_math = self.options.render_math;
         let should_parse_heading_slugs = self.options.parse_heading_slugs;
         let should_parse_metadata_blocks = self.options.render_metadata_blocks;
         let language_registry = self.language_registry.clone();
@@ -969,11 +994,12 @@ impl Markdown {
                 );
             }
 
-            let parsed = parse_markdown_with_options(
+            let parsed = parse_markdown_inner(
                 &source,
                 should_parse_html,
                 should_parse_heading_slugs,
                 should_parse_metadata_blocks,
+                should_render_math,
             );
             let events = parsed.events;
             let language_names = parsed.language_names;
@@ -1077,6 +1103,12 @@ impl Markdown {
                     this.mermaid_state.clear();
                     this.mermaid_showing_code.clear();
                 }
+                if this.options.render_math {
+                    let parsed_markdown = this.parsed_markdown.clone();
+                    this.math_state.update(&parsed_markdown, cx);
+                } else {
+                    this.math_state.clear();
+                }
                 this.pending_parse.take();
                 if this.should_reparse {
                     this.parse(cx);
@@ -1162,6 +1194,11 @@ impl Selection {
                 self.reversed = false;
             }
         }
+        // Math formulas are atomic: a selection touching any part of a formula covers the whole
+        // formula, so highlight and copy stay consistent regardless of the drag end position.
+        let expanded = rendered_text.expand_range_for_atomic_regions(self.start..self.end);
+        self.start = expanded.start;
+        self.end = expanded.end;
     }
 
     fn tail(&self) -> usize {
@@ -1392,6 +1429,93 @@ impl MarkdownElement {
         );
 
         builder.push_image_child(image_element);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_markdown_math(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        source: &str,
+        latex: &SharedString,
+        range: Range<usize>,
+        display: bool,
+        math_state: &MathState,
+        em_px: Pixels,
+        error_color: Hsla,
+    ) {
+        if display {
+            match render_math_block(math_state, latex, em_px) {
+                // Center block (display) math horizontally, like other previewers. The
+                // invisible source anchor makes the formula's source copyable.
+                MathBlock::Element(mut math) => {
+                    builder.flush_text();
+                    let slot: MathBoundsSlot = Rc::new(Cell::new(None));
+                    math.set_bounds_slot(slot.clone());
+                    builder.push_math_region(range.clone(), vec![slot]);
+                    let anchor =
+                        builder.render_copyable_source_anchor(&source[range.clone()], range);
+                    builder.append_child(
+                        div()
+                            .relative()
+                            .child(anchor)
+                            .child(div().w_full().flex().justify_center().child(math))
+                            .into_any_element(),
+                    );
+                }
+                MathBlock::Error(message) => {
+                    self.push_math_error(builder, &message, range, error_color)
+                }
+                // Not parsed yet: show the raw source until it resolves.
+                MathBlock::Pending => builder.push_text(&source[range.clone()], range),
+            }
+        } else {
+            match render_math_inline(math_state, latex, em_px) {
+                // Each fragment is its own flex item so the line can wrap between them; the
+                // per-fragment offset keeps them on a shared baseline. A single invisible
+                // source anchor (for the whole `$...$`) makes the formula copyable.
+                MathInline::Fragments(fragments) => {
+                    builder.flush_text();
+                    let anchor = builder
+                        .render_copyable_source_anchor(&source[range.clone()], range.clone());
+                    builder.push_image_child(anchor);
+                    let mut bounds_cells = Vec::with_capacity(fragments.len());
+                    for mut fragment in fragments {
+                        let slot: MathBoundsSlot = Rc::new(Cell::new(None));
+                        fragment.element.set_bounds_slot(slot.clone());
+                        bounds_cells.push(slot);
+                        builder.push_image_child(
+                            div()
+                                .relative()
+                                .top(fragment.top)
+                                .ml(fragment.left)
+                                .child(fragment.element),
+                        );
+                    }
+                    builder.push_math_region(range, bounds_cells);
+                }
+                MathInline::Error(message) => {
+                    self.push_math_error(builder, &message, range, error_color)
+                }
+                MathInline::Pending => builder.push_text(&source[range.clone()], range),
+            }
+        }
+    }
+
+    /// Show a math parse error in place of the formula, in the theme's error color, like
+    /// other previewers (e.g. VS Code's KaTeX errors).
+    fn push_math_error(
+        &self,
+        builder: &mut MarkdownElementBuilder,
+        message: &str,
+        range: Range<usize>,
+        error_color: Hsla,
+    ) {
+        builder.push_text_style(TextStyleRefinement {
+            color: Some(error_color),
+            ..Default::default()
+        });
+        builder.push_text(message, range);
+        builder.pop_text_style();
     }
 
     fn push_markdown_paragraph(
@@ -1791,9 +1915,17 @@ impl MarkdownElement {
                             let source_index = match position_result {
                                 Ok(ix) | Err(ix) => ix,
                             };
+                            // Double-clicking a drawn formula should select the whole formula
+                            // (atomic). The preview binds double-click to "jump editor to source"
+                            // (on_source_click returns blocked); let that run, but for math keep our
+                            // own formula selection instead of clearing it the way we do for text.
+                            let clicked_math = rendered_text
+                                .math_regions
+                                .iter()
+                                .any(|region| region.touches_index(source_index));
                             if let Some(handler) = on_source_click.as_ref() {
                                 let blocked = handler(source_index, event.click_count, window, cx);
-                                if blocked {
+                                if blocked && !clicked_math {
                                     markdown.selection = Selection::default();
                                     markdown.pressed_link = None;
                                     window.prevent_default();
@@ -1833,6 +1965,8 @@ impl MarkdownElement {
                                     (range, SelectMode::All, false)
                                 }
                             };
+                            // Keep the selection atomic over formulas from the first click/drag.
+                            let range = rendered_text.expand_range_for_atomic_regions(range);
                             markdown.selection = Selection {
                                 start: range.start,
                                 end: range.end,
@@ -1918,8 +2052,10 @@ impl MarkdownElement {
                     markdown.selection.pending = false;
                     #[cfg(any(target_os = "linux", target_os = "freebsd"))]
                     {
-                        let text = rendered_text
-                            .text_for_range(markdown.selection.start..markdown.selection.end);
+                        let range = rendered_text.expand_range_for_atomic_regions(
+                            markdown.selection.start..markdown.selection.end,
+                        );
+                        let text = rendered_text.text_for_range(range);
                         cx.write_to_primary(ClipboardItem::new_string(text))
                     }
                     cx.notify();
@@ -2022,7 +2158,14 @@ impl Element for MarkdownElement {
             self.style.base_text_style.clone(),
             self.style.syntax.clone(),
         );
-        let (parsed_markdown, images, active_root_block, render_mermaid_diagrams, mermaid_state) = {
+        let (
+            parsed_markdown,
+            images,
+            active_root_block,
+            render_mermaid_diagrams,
+            mermaid_state,
+            math_state,
+        ) = {
             let markdown = self.markdown.read(cx);
             (
                 markdown.parsed_markdown.clone(),
@@ -2030,8 +2173,16 @@ impl Element for MarkdownElement {
                 markdown.active_root_block,
                 markdown.options.render_mermaid_diagrams,
                 markdown.mermaid_state.clone(),
+                markdown.math_state.clone(),
             )
         };
+        // One math em is rendered at the body text size, so formulas stay proportional.
+        let math_em_px = self
+            .style
+            .base_text_style
+            .font_size
+            .to_pixels(window.rem_size());
+        let math_error_color = cx.theme().status().error;
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
             last.0.end
         } else {
@@ -2695,6 +2846,30 @@ impl Element for MarkdownElement {
                 MarkdownEvent::TaskListMarker(_) => {
                     // handled inside the `MarkdownTag::Item` case
                 }
+                MarkdownEvent::InlineMath(latex) => {
+                    self.push_markdown_math(
+                        &mut builder,
+                        &parsed_markdown.source,
+                        latex,
+                        range.clone(),
+                        false,
+                        &math_state,
+                        math_em_px,
+                        math_error_color,
+                    );
+                }
+                MarkdownEvent::DisplayMath(latex) => {
+                    self.push_markdown_math(
+                        &mut builder,
+                        &parsed_markdown.source,
+                        latex,
+                        range.clone(),
+                        true,
+                        &math_state,
+                        math_em_px,
+                        math_error_color,
+                    );
+                }
                 MarkdownEvent::FootnoteReference(label) => {
                     builder.push_footnote_ref(label.clone(), range.clone());
                     builder.push_text_style(self.style.link.clone());
@@ -3052,6 +3227,7 @@ struct MetadataCellStyle {
 struct MarkdownElementBuilder {
     div_stack: Vec<DivStackEntry>,
     rendered_lines: Vec<RenderedLine>,
+    math_regions: Vec<MathRegion>,
     pending_line: PendingLine,
     rendered_links: Vec<RenderedLink>,
     rendered_footnote_refs: Vec<RenderedFootnoteRef>,
@@ -3111,6 +3287,7 @@ impl MarkdownElementBuilder {
                 DivStackEntry::new(base_div.debug_selector(|| "inner".into()))
             }],
             rendered_lines: Vec::new(),
+            math_regions: Vec::new(),
             pending_line: PendingLine::default(),
             rendered_links: Vec::new(),
             rendered_footnote_refs: Vec::new(),
@@ -3432,6 +3609,7 @@ impl MarkdownElementBuilder {
             source_end: source_range.end,
             language: None,
             text_align: TextAlign::Left,
+            is_math_anchor: false,
         });
         div()
             .absolute()
@@ -3440,6 +3618,48 @@ impl MarkdownElementBuilder {
             .opacity(0.)
             .child(styled_text)
             .into_any_element()
+    }
+
+    /// Like [`render_source_anchor`], but the (invisible) text carries the element's source
+    /// span verbatim so selection/copy reproduces it. Used for math, which paints separately
+    /// and otherwise contributes no copyable text. `source_text` must equal the source slice
+    /// for `source_range` so rendered and source offsets stay aligned.
+    fn render_copyable_source_anchor(
+        &mut self,
+        source_text: &str,
+        source_range: Range<usize>,
+    ) -> AnyElement {
+        let mut text_style = self.base_text_style.clone();
+        text_style.color = Hsla::transparent_black();
+        let styled_text = StyledText::new(source_text.to_string())
+            .with_runs(vec![text_style.to_run(source_text.len())]);
+        self.rendered_lines.push(RenderedLine {
+            layout: styled_text.layout().clone(),
+            source_mappings: vec![SourceMapping {
+                rendered_index: 0,
+                source_index: source_range.start,
+            }],
+            source_end: source_range.end,
+            language: None,
+            text_align: TextAlign::Left,
+            is_math_anchor: true,
+        });
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .opacity(0.)
+            .child(styled_text)
+            .into_any_element()
+    }
+
+    /// Register a drawn formula's source span together with the bounds cells its `MathElement`
+    /// piece(s) publish during prepaint, so selection can hit-test/highlight where math is drawn.
+    fn push_math_region(&mut self, source_range: Range<usize>, bounds_cells: Vec<MathBoundsSlot>) {
+        self.math_regions.push(MathRegion {
+            source_range,
+            bounds_cells,
+        });
     }
 
     fn flush_text(&mut self) {
@@ -3456,6 +3676,7 @@ impl MarkdownElementBuilder {
             source_end: self.current_source_index,
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
+            is_math_anchor: false,
         });
         self.append_child(text.into_any());
     }
@@ -3469,6 +3690,7 @@ impl MarkdownElementBuilder {
                 lines: self.rendered_lines.into(),
                 links: self.rendered_links.into(),
                 footnote_refs: self.rendered_footnote_refs.into(),
+                math_regions: self.math_regions.into(),
             },
         }
     }
@@ -3480,6 +3702,10 @@ struct RenderedLine {
     source_end: usize,
     language: Option<Arc<Language>>,
     text_align: TextAlign,
+    /// True for the invisible copyable source anchor of a drawn formula. Such a line carries the
+    /// LaTeX source for copy, but its layout coordinates are unrelated to the painted math, so it
+    /// must be excluded from selection-highlight bounds (the math region's bounds are used instead).
+    is_math_anchor: bool,
 }
 
 impl RenderedLine {
@@ -3663,11 +3889,45 @@ pub struct RenderedMarkdown {
     text: RenderedText,
 }
 
+/// A drawn math formula's source span paired with the painted bounds of its piece(s). Inline
+/// formulas can split into several fragments (and wrap across rows), so a region holds one bounds
+/// cell per fragment rather than a single union rectangle. Cells are shared with the `MathElement`s,
+/// which publish their bounds during prepaint, so reads here see the location the math is drawn at.
+struct MathRegion {
+    source_range: Range<usize>,
+    bounds_cells: Vec<MathBoundsSlot>,
+}
+
+impl MathRegion {
+    /// Painted bounds of each fragment laid out this frame (empty before the first prepaint).
+    fn bounds(&self) -> impl Iterator<Item = Bounds<Pixels>> + '_ {
+        self.bounds_cells.iter().filter_map(|cell| cell.get())
+    }
+
+    /// The fragment bounds containing `position`, if any.
+    fn bounds_containing(&self, position: Point<Pixels>) -> Option<Bounds<Pixels>> {
+        self.bounds().find(|bounds| bounds.contains(&position))
+    }
+
+    /// Whether `range` overlaps this formula's source span (touching at a boundary does not count).
+    fn overlaps(&self, range: &Range<usize>) -> bool {
+        self.source_range.start < range.end && range.start < self.source_range.end
+    }
+
+    /// Whether `source_index` falls on or within this formula's span. Both boundaries count, so a
+    /// hit resolved to `source_range.start` or `source_range.end` is recognized as "this formula"
+    /// for word/line selection and caret positioning.
+    fn touches_index(&self, source_index: usize) -> bool {
+        self.source_range.start <= source_index && source_index <= self.source_range.end
+    }
+}
+
 #[derive(Clone)]
 struct RenderedText {
     lines: Rc<[RenderedLine]>,
     links: Rc<[RenderedLink]>,
     footnote_refs: Rc<[RenderedFootnoteRef]>,
+    math_regions: Rc<[MathRegion]>,
 }
 
 struct WrappedLineSegment {
@@ -3697,6 +3957,19 @@ impl RenderedText {
             .collect()
     }
 
+    /// Expand `range` so any drawn formula it overlaps is fully covered. Math is atomic for
+    /// selection/copy (matching KaTeX's copy-tex), and the copyable LaTeX source for a formula
+    /// lives in one anchor line, so a partial range must be widened to copy the whole formula.
+    fn expand_range_for_atomic_regions(&self, mut range: Range<usize>) -> Range<usize> {
+        for region in self.math_regions.iter() {
+            if region.overlaps(&range) {
+                range.start = range.start.min(region.source_range.start);
+                range.end = range.end.max(region.source_range.end);
+            }
+        }
+        range
+    }
+
     fn bounds_for_sorted_source_ranges(
         &self,
         ranges: impl IntoIterator<Item = (usize, Range<usize>)>,
@@ -3706,6 +3979,12 @@ impl RenderedText {
         let mut first_possible_range_ix = 0;
 
         for line in self.lines.iter() {
+            // The invisible math source anchor's layout coordinates are unrelated to the drawn
+            // formula, so it must not contribute highlight bounds. Selection adds the formula's
+            // painted bounds separately in `bounds_for_source_range`.
+            if line.is_math_anchor {
+                continue;
+            }
             let line_source_start = line.source_mappings.first().unwrap().source_index;
             while ranges
                 .get(first_possible_range_ix)
@@ -3739,6 +4018,17 @@ impl RenderedText {
                     range.start.max(line_source_start)..range.end.min(line.source_end),
                 );
                 range_ix += 1;
+            }
+        }
+
+        // A drawn formula's invisible anchor line is skipped above (its layout coordinates are
+        // unrelated to the painted math), so add the formula's painted bounds for any range that
+        // touches it. This covers both selection and search highlights of math source spans.
+        for (highlight_ix, range) in &ranges {
+            for region in self.math_regions.iter() {
+                if region.overlaps(range) {
+                    all_bounds.extend(region.bounds().map(|bounds| (*highlight_ix, bounds)));
+                }
             }
         }
 
@@ -3846,10 +4136,30 @@ impl RenderedText {
     }
 
     fn source_index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
+        // Drawn math is atomic: a hit inside a formula's painted bounds maps to its source-span
+        // boundary (left half -> start, right half -> end) so selection aligns with the glyphs
+        // instead of the invisible source anchor, which sits at unrelated coordinates.
+        for region in self.math_regions.iter() {
+            if let Some(bounds) = region.bounds_containing(position) {
+                let boundary = if position.x < bounds.center().x {
+                    region.source_range.start
+                } else {
+                    region.source_range.end
+                };
+                return Ok(boundary);
+            }
+        }
+
         let mut lines = self.lines.iter().peekable();
         let mut fallback_line: Option<&RenderedLine> = None;
 
         while let Some(line) = lines.next() {
+            // A formula's invisible source anchor sits at unrelated coordinates; hits inside the
+            // drawn math are handled by the region check above, so never resolve a pixel position
+            // through an anchor line (its hidden text would otherwise capture stray clicks).
+            if line.is_math_anchor {
+                continue;
+            }
             let line_bounds = line.layout.bounds();
 
             // Exact match: position is within bounds (handles overlapping bounds like table columns)
@@ -3881,7 +4191,19 @@ impl RenderedText {
     }
 
     fn position_for_source_index(&self, source_index: usize) -> Option<(Point<Pixels>, Pixels)> {
+        // For a drawn formula, use its painted bounds rather than the invisible anchor's location.
+        if let Some(region) = self
+            .math_regions
+            .iter()
+            .find(|region| region.touches_index(source_index))
+            && let Some(bounds) = region.bounds().next()
+        {
+            return Some((bounds.origin, bounds.size.height));
+        }
         for line in self.lines.iter() {
+            if line.is_math_anchor {
+                continue;
+            }
             let line_source_start = line.source_mappings.first().unwrap().source_index;
             if source_index < line_source_start {
                 break;
@@ -3898,8 +4220,16 @@ impl RenderedText {
     }
 
     fn surrounding_word_range(&self, source_index: usize) -> Range<usize> {
+        // Double-clicking a formula selects the whole formula (atomic), not a word of hidden source.
+        if let Some(region) = self
+            .math_regions
+            .iter()
+            .find(|region| region.touches_index(source_index))
+        {
+            return region.source_range.clone();
+        }
         for line in self.lines.iter() {
-            if source_index > line.source_end {
+            if line.is_math_anchor || source_index > line.source_end {
                 continue;
             }
 
@@ -3945,8 +4275,17 @@ impl RenderedText {
     }
 
     fn surrounding_line_range(&self, source_index: usize) -> Range<usize> {
+        // Triple-clicking a formula selects the whole formula atomically rather than routing through
+        // the invisible anchor's hidden source line.
+        if let Some(region) = self
+            .math_regions
+            .iter()
+            .find(|region| region.touches_index(source_index))
+        {
+            return region.source_range.clone();
+        }
         for line in self.lines.iter() {
-            if source_index > line.source_end {
+            if line.is_math_anchor || source_index > line.source_end {
                 continue;
             }
             let line_source_start = line.source_mappings.first().unwrap().source_index;
@@ -5000,7 +5339,7 @@ mod tests {
     }
 
     fn has_code_block(markdown: &str) -> bool {
-        let parsed_data = parse_markdown_with_options(markdown, false, false, false);
+        let parsed_data = crate::parser::parse_markdown_with_options(markdown, false, false, false);
         parsed_data
             .events
             .iter()
