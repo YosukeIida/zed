@@ -505,6 +505,7 @@ ztracing_macro = { path = "crates/ztracing_macro" }
 accesskit = "0.24.0"
 accesskit_macos = "0.26.0"
 accesskit_unix = "0.21.0"
+ab_glyph = "0.2"
 accesskit_windows = "0.33.1"
 agent-client-protocol = { version = "=1.0.1", features = ["unstable"] }
 aho-corasick = "1.1"
@@ -712,6 +713,11 @@ pulldown-cmark = { version = "0.13.0", default-features = false }
 quick-xml = "0.38"
 quote = "1.0.9"
 rand = "0.9"
+ratex-font = "0.1.12"
+ratex-font-loader = { version = "0.1.12", features = ["embed-fonts"] }
+ratex-layout = "0.1.12"
+ratex-parser = "0.1.12"
+ratex-types = "0.1.12"
 rayon = "1.8"
 regex = "1.5"
 # WARNING: If you change this, you must also publish a new version of zed-reqwest to crates.io
