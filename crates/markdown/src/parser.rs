@@ -228,11 +228,34 @@ fn is_br_tag(html: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case("br"))
 }
 
+/// Test-only convenience wrapper that parses with math disabled. Production code calls
+/// [`parse_markdown_inner`] directly so it can opt into math parsing.
+#[cfg(test)]
 pub(crate) fn parse_markdown_with_options(
     text: &str,
     parse_html: bool,
     parse_heading_slugs: bool,
     parse_metadata_blocks: bool,
+) -> ParsedMarkdownData {
+    parse_markdown_inner(
+        text,
+        parse_html,
+        parse_heading_slugs,
+        parse_metadata_blocks,
+        false,
+    )
+}
+
+/// Like [`parse_markdown_with_options`], but allows enabling LaTeX math parsing
+/// (`$...$` / `$$...$$`). Math is gated behind `parse_math` because the `markdown`
+/// crate is shared by surfaces (e.g. chat) where a bare `$` should stay literal; only
+/// the Markdown preview opts in.
+pub(crate) fn parse_markdown_inner(
+    text: &str,
+    parse_html: bool,
+    parse_heading_slugs: bool,
+    parse_metadata_blocks: bool,
+    parse_math: bool,
 ) -> ParsedMarkdownData {
     let mut state = ParseState::default();
     let mut language_names = HashSet::default();
@@ -245,11 +268,13 @@ pub(crate) fn parse_markdown_with_options(
     let mut within_table = false;
     let mut current_metadata_block_start = None;
     let mut metadata_block_content_range: Option<Range<usize>> = None;
-    let parse_options = if parse_metadata_blocks {
-        PARSE_OPTIONS.union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS)
-    } else {
-        PARSE_OPTIONS
-    };
+    let mut parse_options = PARSE_OPTIONS;
+    if parse_metadata_blocks {
+        parse_options = parse_options.union(Options::ENABLE_YAML_STYLE_METADATA_BLOCKS);
+    }
+    if parse_math {
+        parse_options = parse_options.union(Options::ENABLE_MATH);
+    }
     let mut parser = Parser::new_ext(text, parse_options)
         .into_offset_iter()
         .peekable();
@@ -666,8 +691,22 @@ pub(crate) fn parse_markdown_with_options(
             pulldown_cmark::Event::TaskListMarker(checked) => {
                 state.push_event(range, MarkdownEvent::TaskListMarker(checked))
             }
-            pulldown_cmark::Event::InlineMath(_) | pulldown_cmark::Event::DisplayMath(_) => {}
+            pulldown_cmark::Event::InlineMath(math) => state.push_event(
+                range,
+                MarkdownEvent::InlineMath(SharedString::from(math.to_string())),
+            ),
+            pulldown_cmark::Event::DisplayMath(math) => state.push_event(
+                range,
+                MarkdownEvent::DisplayMath(SharedString::from(math.to_string())),
+            ),
         }
+    }
+
+    // pulldown-cmark only delimits `$...$` math when its braces are balanced; recover the
+    // remaining `$...$` spans (which are malformed math) so they surface a parse error rather
+    // than leaking raw source, matching KaTeX-based previewers.
+    if parse_math {
+        state.events = recover_unparsed_math(std::mem::take(&mut state.events), text);
     }
 
     let heading_slugs = if parse_heading_slugs {
@@ -686,6 +725,124 @@ pub(crate) fn parse_markdown_with_options(
         metadata_blocks,
         heading_slugs,
         footnote_definitions,
+    }
+}
+
+/// Re-scan plain-text events for `$...$` / `$$...$$` math that pulldown-cmark left untouched
+/// (it only delimits math with balanced braces). Matched spans become `InlineMath`/`DisplayMath`
+/// events; the renderer then shows a parse error for malformed content instead of raw source.
+fn recover_unparsed_math(
+    events: Vec<(Range<usize>, MarkdownEvent)>,
+    text: &str,
+) -> Vec<(Range<usize>, MarkdownEvent)> {
+    let mut out = Vec::with_capacity(events.len());
+    let mut i = 0;
+    while i < events.len() {
+        if matches!(events[i].1, MarkdownEvent::Text) {
+            // pulldown splits text at a failed-math `$`, so a `$...$` span can straddle
+            // adjacent text events; merge contiguous ones before scanning.
+            let start = events[i].0.start;
+            let mut end = events[i].0.end;
+            let mut j = i + 1;
+            while j < events.len()
+                && matches!(events[j].1, MarkdownEvent::Text)
+                && events[j].0.start == end
+            {
+                end = events[j].0.end;
+                j += 1;
+            }
+            push_text_with_recovered_math(&text[start..end], start, &mut out);
+            i = j;
+        } else {
+            out.push(events[i].clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+/// True if the `$` at byte `idx` is escaped by an odd run of preceding backslashes.
+fn dollar_is_escaped(bytes: &[u8], idx: usize) -> bool {
+    let mut backslashes = 0;
+    let mut k = idx;
+    while k > 0 && bytes[k - 1] == b'\\' {
+        backslashes += 1;
+        k -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// Find the byte offset of the closing math delimiter starting at or after `from`, applying
+/// the flanking rule that the character before the closing `$` must not be whitespace (this is
+/// what keeps `$5 ... $6` from being treated as math).
+fn find_math_close(slice: &str, from: usize, delim: usize) -> Option<usize> {
+    let bytes = slice.as_bytes();
+    let len = slice.len();
+    let mut j = from;
+    while j < len {
+        if bytes[j] == b'$' && !dollar_is_escaped(bytes, j) {
+            let run = if j + 1 < len && bytes[j + 1] == b'$' { 2 } else { 1 };
+            if run >= delim
+                && j > from
+                && slice[..j]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| !c.is_whitespace())
+            {
+                return Some(j);
+            }
+            j += run;
+        } else {
+            j += 1;
+        }
+    }
+    None
+}
+
+/// Emit Text/InlineMath/DisplayMath events for `slice`, whose absolute start is `base`.
+fn push_text_with_recovered_math(
+    slice: &str,
+    base: usize,
+    out: &mut Vec<(Range<usize>, MarkdownEvent)>,
+) {
+    let bytes = slice.as_bytes();
+    let len = slice.len();
+    let mut run_start = 0;
+    let mut idx = 0;
+    while idx < len {
+        if bytes[idx] == b'$' && !dollar_is_escaped(bytes, idx) {
+            let display = idx + 1 < len && bytes[idx + 1] == b'$';
+            let delim = if display { 2 } else { 1 };
+            let content_start = idx + delim;
+            let opens = slice
+                .get(content_start..)
+                .and_then(|rest| rest.chars().next())
+                .is_some_and(|c| !c.is_whitespace());
+            if opens {
+                if let Some(close) = find_math_close(slice, content_start, delim) {
+                    let content = &slice[content_start..close];
+                    if !content.trim().is_empty() {
+                        if idx > run_start {
+                            out.push((base + run_start..base + idx, MarkdownEvent::Text));
+                        }
+                        let end = close + delim;
+                        let event = if display {
+                            MarkdownEvent::DisplayMath(SharedString::from(content.to_string()))
+                        } else {
+                            MarkdownEvent::InlineMath(SharedString::from(content.to_string()))
+                        };
+                        out.push((base + idx..base + end, event));
+                        run_start = end;
+                        idx = end;
+                        continue;
+                    }
+                }
+            }
+        }
+        idx += 1;
+    }
+    if run_start < len {
+        out.push((base + run_start..base + len, MarkdownEvent::Text));
     }
 }
 
@@ -787,6 +944,10 @@ pub enum MarkdownEvent {
     Rule,
     /// A task list marker, rendered as a checkbox in HTML. Contains a true when it is checked.
     TaskListMarker(bool),
+    /// Inline LaTeX math (`$...$`). Contains the math source with delimiters stripped.
+    InlineMath(SharedString),
+    /// Display (block) LaTeX math (`$$...$$`). Contains the math source with delimiters stripped.
+    DisplayMath(SharedString),
     /// Start of a root-level block (a top-level structural element like a paragraph, heading, list, etc.).
     RootStart,
     /// End of a root-level block. Contains the root block index.
@@ -943,10 +1104,10 @@ mod tests {
     use super::MarkdownTag::*;
     use super::*;
 
-    const CONDITIONAL_OPTIONS: Options = Options::ENABLE_YAML_STYLE_METADATA_BLOCKS;
-    const UNWANTED_OPTIONS: Options = Options::ENABLE_MATH
-        .union(Options::ENABLE_DEFINITION_LIST)
-        .union(Options::ENABLE_WIKILINKS);
+    const CONDITIONAL_OPTIONS: Options =
+        Options::ENABLE_YAML_STYLE_METADATA_BLOCKS.union(Options::ENABLE_MATH);
+    const UNWANTED_OPTIONS: Options =
+        Options::ENABLE_DEFINITION_LIST.union(Options::ENABLE_WIKILINKS);
 
     #[test]
     fn all_options_considered() {
@@ -1315,6 +1476,78 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+
+    fn math_sources(parsed: &ParsedMarkdownData) -> Vec<String> {
+        parsed
+            .events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                InlineMath(latex) | DisplayMath(latex) => Some(latex.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_inline_math_parsing() {
+        let parsed = parse_markdown_inner("before $x^2$ after", false, false, false, true);
+        assert!(
+            parsed
+                .events
+                .iter()
+                .any(|(_, event)| matches!(event, InlineMath(latex) if latex.as_ref() == "x^2")),
+        );
+        assert_eq!(math_sources(&parsed), vec!["x^2".to_string()]);
+    }
+
+    #[test]
+    fn test_display_math_parsing() {
+        let parsed = parse_markdown_inner("$$\n\\frac{a}{b}\n$$", false, false, false, true);
+        let display: Vec<_> = parsed
+            .events
+            .iter()
+            .filter_map(|(_, event)| match event {
+                DisplayMath(latex) => Some(latex.to_string()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(display.len(), 1);
+        assert!(display[0].contains("\\frac{a}{b}"));
+    }
+
+    #[test]
+    fn test_math_disabled_keeps_dollars_literal() {
+        // Math parsing is off for non-preview surfaces, so `$...$` must stay literal text.
+        let parsed = parse_markdown_inner("price is $5 and $6", false, false, false, false);
+        assert!(math_sources(&parsed).is_empty());
+    }
+
+    #[test]
+    fn test_escaped_dollar_is_not_math() {
+        let parsed = parse_markdown_inner("cost \\$5 today", false, false, false, true);
+        assert!(math_sources(&parsed).is_empty());
+    }
+
+    #[test]
+    fn test_recovers_brace_unbalanced_math() {
+        // pulldown-cmark won't delimit this (unbalanced brace); recovery should, so the
+        // renderer can surface a parse error instead of leaking the raw source.
+        let parsed = parse_markdown_inner("broken $\\unknown{$", false, false, false, true);
+        assert_eq!(math_sources(&parsed), vec!["\\unknown{".to_string()]);
+    }
+
+    #[test]
+    fn test_recovery_keeps_currency_as_text() {
+        // A closing `$` preceded by whitespace is not a delimiter, so currency stays text.
+        let parsed = parse_markdown_inner("price is $5 and $6 today", false, false, false, true);
+        assert!(math_sources(&parsed).is_empty());
+    }
+
+    #[test]
+    fn test_recovery_disabled_when_math_off() {
+        let parsed = parse_markdown_inner("broken $\\unknown{$", false, false, false, false);
+        assert!(math_sources(&parsed).is_empty());
     }
 
     fn assert_code_block_does_not_emit_links(markdown: &str) {
@@ -1827,5 +2060,55 @@ mod tests {
                 "unrecognized inline HTML \"{input}\" should not emit HardBreak"
             );
         }
+    }
+
+    /// Parse with LaTeX math enabled (as the Markdown preview does) and everything else off.
+    fn parse_math(text: &str) -> Vec<(Range<usize>, MarkdownEvent)> {
+        parse_markdown_inner(text, false, false, false, true).events
+    }
+
+    #[test]
+    fn test_math_events_are_preserved() {
+        assert_eq!(
+            parse_math("Before $x^2$ after\n\n$$y$$"),
+            vec![
+                (0..19, RootStart),
+                (0..19, Start(Paragraph)),
+                (0..7, Text),
+                (7..12, InlineMath("x^2".into())),
+                (12..18, Text),
+                (0..19, End(MarkdownTagEnd::Paragraph)),
+                (0..19, RootEnd(0)),
+                (20..25, RootStart),
+                (20..25, Start(Paragraph)),
+                (20..25, DisplayMath("y".into())),
+                (20..25, End(MarkdownTagEnd::Paragraph)),
+                (20..25, RootEnd(1)),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_heading_inline_math_event_ranges_are_preserved() {
+        use pulldown_cmark::HeadingLevel;
+        assert_eq!(
+            parse_math("# Title $x^2$"),
+            vec![
+                (0..13, RootStart),
+                (
+                    0..13,
+                    Start(Heading {
+                        level: HeadingLevel::H1,
+                        id: None,
+                        classes: Vec::new(),
+                        attrs: Vec::new(),
+                    })
+                ),
+                (2..8, Text),
+                (8..13, InlineMath("x^2".into())),
+                (0..13, End(MarkdownTagEnd::Heading(HeadingLevel::H1))),
+                (0..13, RootEnd(0)),
+            ]
+        );
     }
 }
