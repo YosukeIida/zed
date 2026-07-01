@@ -12,7 +12,9 @@ pub struct MarkdownPreviewSettings {
 impl Settings for MarkdownPreviewSettings {
     fn from_settings(content: &settings::SettingsContent) -> Self {
         let content = content.markdown_preview.clone().unwrap_or_default();
-        let max_width = if content.limit_content_width.unwrap_or(true) {
+        // Fork default: render the preview edge to edge unless the user explicitly opts into
+        // a limited content width (upstream defaults this to `true`).
+        let max_width = if content.limit_content_width.unwrap_or(false) {
             content.max_width.map(px)
         } else {
             None
