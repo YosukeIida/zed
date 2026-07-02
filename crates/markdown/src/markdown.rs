@@ -1431,7 +1431,6 @@ impl MarkdownElement {
         builder.push_image_child(image_element);
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn push_markdown_math(
         &self,
         builder: &mut MarkdownElementBuilder,
@@ -1440,11 +1439,10 @@ impl MarkdownElement {
         range: Range<usize>,
         display: bool,
         math_state: &MathState,
-        em_px: Pixels,
         error_color: Hsla,
     ) {
         if display {
-            match render_math_block(math_state, latex, em_px) {
+            match render_math_block(math_state, latex) {
                 // Center block (display) math horizontally, like other previewers. The
                 // invisible source anchor makes the formula's source copyable.
                 MathBlock::Element(mut math) => {
@@ -1469,10 +1467,11 @@ impl MarkdownElement {
                 MathBlock::Pending => builder.push_text(&source[range.clone()], range),
             }
         } else {
-            match render_math_inline(math_state, latex, em_px) {
-                // Each fragment is its own flex item so the line can wrap between them; the
-                // per-fragment offset keeps them on a shared baseline. A single invisible
-                // source anchor (for the whole `$...$`) makes the formula copyable.
+            match render_math_inline(math_state, latex) {
+                // Each fragment is its own flex item so the line can wrap between them; each
+                // fragment carries its own baseline offset and inter-fragment gap (in em,
+                // resolved at layout), so no wrapping div is needed. A single invisible source
+                // anchor (for the whole `$...$`) makes the formula copyable.
                 MathInline::Fragments(fragments) => {
                     builder.flush_text();
                     let anchor = builder
@@ -1481,15 +1480,9 @@ impl MarkdownElement {
                     let mut bounds_cells = Vec::with_capacity(fragments.len());
                     for mut fragment in fragments {
                         let slot: MathBoundsSlot = Rc::new(Cell::new(None));
-                        fragment.element.set_bounds_slot(slot.clone());
+                        fragment.set_bounds_slot(slot.clone());
                         bounds_cells.push(slot);
-                        builder.push_image_child(
-                            div()
-                                .relative()
-                                .top(fragment.top)
-                                .ml(fragment.left)
-                                .child(fragment.element),
-                        );
+                        builder.push_image_child(fragment);
                     }
                     builder.push_math_region(range, bounds_cells);
                 }
@@ -2176,12 +2169,6 @@ impl Element for MarkdownElement {
                 markdown.math_state.clone(),
             )
         };
-        // One math em is rendered at the body text size, so formulas stay proportional.
-        let math_em_px = self
-            .style
-            .base_text_style
-            .font_size
-            .to_pixels(window.rem_size());
         let math_error_color = cx.theme().status().error;
         let markdown_end = if let Some(last) = parsed_markdown.events.last() {
             last.0.end
@@ -2631,6 +2618,15 @@ impl Element for MarkdownElement {
                                 range,
                                 markdown_end,
                             );
+                            // Plain content div: `push_image_child` rewrites the *current* div
+                            // into a wrapping flex row (for inline images/math). Keeping that on
+                            // this innermost div preserves the flex_1/justify_center vertical
+                            // centering of the div above it.
+                            builder.push_div(
+                                div().w_full().text_align(text_align),
+                                range,
+                                markdown_end,
+                            );
                         }
                         _ => log::debug!("unsupported markdown tag {:?}", tag),
                     }
@@ -2760,6 +2756,7 @@ impl Element for MarkdownElement {
                         builder.replace_pending_checkbox(self.on_checkbox_toggle.clone());
                         builder.pop_div();
                         builder.pop_div();
+                        builder.pop_div();
                         builder.pop_text_style();
                         builder.table.end_cell();
                     }
@@ -2854,7 +2851,6 @@ impl Element for MarkdownElement {
                         range.clone(),
                         false,
                         &math_state,
-                        math_em_px,
                         math_error_color,
                     );
                 }
@@ -2866,7 +2862,6 @@ impl Element for MarkdownElement {
                         range.clone(),
                         true,
                         &math_state,
-                        math_em_px,
                         math_error_color,
                     );
                 }

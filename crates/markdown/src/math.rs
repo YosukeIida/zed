@@ -110,9 +110,6 @@ fn parse_to_display_list(latex: &str, display: bool) -> anyhow::Result<DisplayLi
     Ok(ratex_layout::to_display_list(&layout_box))
 }
 
-/// Approximate body line height as a multiple of the em (the preview paragraph uses a
-/// ~1.3rem line height over ~0.92rem text, giving roughly this ratio).
-const LINE_HEIGHT_EM: f32 = 1.4;
 /// Horizontal gap (in em) inserted before each fragment after the first to approximate the
 /// inter-operator spacing lost when an inline formula is split for wrapping.
 const INTER_FRAGMENT_EM: f32 = 0.22;
@@ -126,23 +123,22 @@ pub(crate) enum MathBlock {
     Pending,
 }
 
-/// Outcome of rendering an inline formula (possibly split into breakable fragments).
+/// Outcome of rendering an inline formula (possibly split into breakable fragments). Each
+/// fragment is a [`MathElement`] carrying its own baseline offset and inter-fragment gap.
 pub(crate) enum MathInline {
-    Fragments(Vec<InlineFragment>),
+    Fragments(Vec<MathElement>),
     Error(SharedString),
     Pending,
 }
 
 /// Builds the element for a block (display) formula.
-pub(crate) fn render_math_block(
-    math_state: &MathState,
-    latex: &SharedString,
-    em_px: Pixels,
-) -> MathBlock {
+pub(crate) fn render_math_block(math_state: &MathState, latex: &SharedString) -> MathBlock {
     match math_state.result(latex, true) {
+        // Block math occupies its full natural height and needs no baseline sharing.
         Some(Ok(display_list)) => MathBlock::Element(MathElement {
             display_list,
-            em_px,
+            left_em: 0.0,
+            line: None,
             bounds_slot: None,
         }),
         Some(Err(message)) => MathBlock::Error(message),
@@ -150,23 +146,11 @@ pub(crate) fn render_math_block(
     }
 }
 
-/// One piece of a (possibly split) inline formula, with its vertical offset (to share a
-/// common baseline with the other pieces) and left gap (operator spacing).
-pub(crate) struct InlineFragment {
-    pub(crate) element: MathElement,
-    pub(crate) top: Pixels,
-    pub(crate) left: Pixels,
-}
-
 /// Builds the breakable pieces of an inline formula. The formula is split at top-level
 /// operators so the surrounding flex line can wrap between pieces; all pieces share one
 /// baseline so they still read as a single formula. Returns `None` (fall back to raw text)
 /// if any piece fails to parse.
-pub(crate) fn render_math_inline(
-    math_state: &MathState,
-    latex: &SharedString,
-    em_px: Pixels,
-) -> MathInline {
+pub(crate) fn render_math_inline(math_state: &MathState, latex: &SharedString) -> MathInline {
     let fragments = split_inline_math(latex);
     let mut lists = Vec::with_capacity(fragments.len());
     for fragment in &fragments {
@@ -180,7 +164,9 @@ pub(crate) fn render_math_inline(
         return MathInline::Pending;
     }
 
-    // Center the tallest piece in the line; every piece shares that baseline.
+    // Every piece shares one baseline, defined by the tallest piece. The actual baseline
+    // position is resolved at layout time from the cascaded text style (see
+    // [`Element::request_layout`]), so here we only record the shared extents in em.
     let (height_of_tallest, total_of_tallest) = lists.iter().fold((0.0f32, 0.0f32), |acc, dl| {
         let total = (dl.height + dl.depth) as f32;
         if total > acc.1 {
@@ -189,24 +175,19 @@ pub(crate) fn render_math_inline(
             acc
         }
     });
-    let common_baseline = (LINE_HEIGHT_EM - total_of_tallest) / 2.0 + height_of_tallest;
+    let line = Some(InlineLine {
+        tallest_height_em: height_of_tallest,
+        tallest_depth_em: (total_of_tallest - height_of_tallest).max(0.0),
+    });
 
     let mut out = Vec::with_capacity(lists.len());
     for (index, display_list) in lists.into_iter().enumerate() {
-        let top = em_px * (common_baseline - display_list.height as f32);
-        let left = if index == 0 {
-            px(0.0)
-        } else {
-            em_px * INTER_FRAGMENT_EM
-        };
-        out.push(InlineFragment {
-            element: MathElement {
-                display_list,
-                em_px,
-                bounds_slot: None,
-            },
-            top,
-            left,
+        let left_em = if index == 0 { 0.0 } else { INTER_FRAGMENT_EM };
+        out.push(MathElement {
+            display_list,
+            left_em,
+            line,
+            bounds_slot: None,
         });
     }
     MathInline::Fragments(out)
@@ -338,26 +319,62 @@ fn split_inline_math(latex: &str) -> Vec<String> {
 /// for that. `Option` is `None` until the element has been laid out at least once this frame.
 pub(crate) type MathBoundsSlot = Rc<Cell<Option<Bounds<Pixels>>>>;
 
+/// Shared line extents (in em) of an inline formula's fragments, used at layout time to put
+/// every fragment on one baseline that also matches the surrounding text's baseline.
+#[derive(Clone, Copy)]
+struct InlineLine {
+    /// Height above the shared baseline of the tallest fragment.
+    tallest_height_em: f32,
+    /// Depth below the shared baseline of the tallest fragment.
+    tallest_depth_em: f32,
+}
+
 /// A GPUI element that paints a RaTeX [`DisplayList`] as native vector graphics.
+///
+/// All geometry is kept in em units and resolved against the cascaded text style at layout
+/// time (see [`Element::request_layout`]), so a formula inside a heading or other scaled
+/// context picks up the surrounding font size, line height, and baseline instead of values
+/// fixed when the tree was built.
 pub(crate) struct MathElement {
     display_list: Arc<DisplayList>,
-    em_px: Pixels,
+    /// Horizontal gap (in em) before the formula (inter-fragment spacing). Zero for block
+    /// math and the first inline fragment.
+    left_em: f32,
+    /// `Some` for inline fragments (baseline-aligned within the text line box); `None` for
+    /// block math, which occupies its natural extent.
+    line: Option<InlineLine>,
     /// Set by [`push_markdown_math`](crate::markdown) so prepaint can publish the painted bounds.
     bounds_slot: Option<MathBoundsSlot>,
 }
 
+/// Geometry resolved from the cascaded text style during layout, handed to prepaint and
+/// paint so they place and scale the em-relative display list consistently.
+pub(crate) struct ResolvedMathGeometry {
+    em_px: Pixels,
+    /// Vertical offset of the formula's top within the element's layout bounds.
+    top: Pixels,
+}
+
 impl MathElement {
-    fn width_px(&self) -> Pixels {
-        self.em_px * self.display_list.width.max(0.0) as f32
-    }
-
-    fn height_px(&self) -> Pixels {
-        self.em_px * (self.display_list.height + self.display_list.depth).max(0.0) as f32
-    }
-
     /// Attach the shared slot that prepaint publishes the painted bounds into.
     pub(crate) fn set_bounds_slot(&mut self, slot: MathBoundsSlot) {
         self.bounds_slot = Some(slot);
+    }
+
+    /// The rectangle the display list actually paints into, given the resolved geometry and
+    /// this element's layout bounds. It is inset from `bounds` by the baseline/gap offsets and
+    /// sized to the formula's natural extent (not the surrounding line box).
+    fn painted_bounds(
+        &self,
+        bounds: Bounds<Pixels>,
+        geometry: &ResolvedMathGeometry,
+    ) -> Bounds<Pixels> {
+        let origin = bounds.origin + point(geometry.em_px * self.left_em, geometry.top);
+        let size = size(
+            geometry.em_px * self.display_list.width.max(0.0) as f32,
+            geometry.em_px * (self.display_list.height + self.display_list.depth).max(0.0) as f32,
+        );
+        Bounds { origin, size }
     }
 }
 
@@ -370,7 +387,7 @@ impl IntoElement for MathElement {
 }
 
 impl Element for MathElement {
-    type RequestLayoutState = ();
+    type RequestLayoutState = ResolvedMathGeometry;
     type PrepaintState = ();
 
     fn id(&self) -> Option<gpui::ElementId> {
@@ -388,16 +405,51 @@ impl Element for MathElement {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
+        // GPUI runs a div's children's `request_layout` inside `window.with_text_style(...)`, so
+        // the text style here is the cascaded one (e.g. the heading font size and line height),
+        // letting a formula scale with its surrounding context.
+        let text_style = window.text_style();
+        let rem_size = window.rem_size();
+        let em_px = text_style.font_size.to_pixels(rem_size);
+
+        let (top, box_height) = if let Some(line) = self.line {
+            // Put the fragments' shared baseline exactly where the neighboring text's glyph
+            // baseline sits in its line box. Text paints its baseline from the shaped line's
+            // metrics, which differ from the raw `FontMetrics` (the platform derives line
+            // bounds differently), so shape a one-character probe with the same style and use
+            // its metrics; the shaped layout is cached, making this a lookup on later frames.
+            // A formula taller than the line pushes the baseline down / the box bottom up
+            // instead of overflowing, so offsets stay non-negative and nothing escapes a
+            // clipping ancestor such as a table cell.
+            let line_height = window.pixel_snap(text_style.line_height_in_pixels(rem_size));
+            let probe =
+                window
+                    .text_system()
+                    .shape_line("x".into(), em_px, &[text_style.to_run(1)], None);
+            let text_baseline = (line_height - probe.ascent - probe.descent) / 2. + probe.ascent;
+            let baseline = text_baseline.max(em_px * line.tallest_height_em);
+            let box_height = line_height.max(baseline + em_px * line.tallest_depth_em);
+            let top = baseline - em_px * self.display_list.height.max(0.0) as f32;
+            (top, box_height)
+        } else {
+            let box_height =
+                em_px * (self.display_list.height + self.display_list.depth).max(0.0) as f32;
+            (px(0.0), box_height)
+        };
+
         let mut style = Style::default();
         style.size = Size {
             width: Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(
-                self.width_px(),
+                em_px * (self.left_em + self.display_list.width.max(0.0) as f32),
             ))),
             height: Length::Definite(DefiniteLength::Absolute(AbsoluteLength::Pixels(
-                self.height_px(),
+                box_height,
             ))),
         };
-        (window.request_layout(style, [], cx), ())
+        (
+            window.request_layout(style, [], cx),
+            ResolvedMathGeometry { em_px, top },
+        )
     }
 
     fn prepaint(
@@ -405,14 +457,15 @@ impl Element for MathElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        geometry: &mut Self::RequestLayoutState,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Self::PrepaintState {
-        // Publish the final painted bounds (after block centering / inline flex layout) so the
-        // markdown selection layer can hit-test and highlight the math where it is actually drawn.
+        // Publish the actual painted rectangle (inset by the baseline/gap offsets, sized to the
+        // formula's natural extent) so the markdown selection layer highlights where the math is
+        // really drawn rather than the surrounding line box.
         if let Some(slot) = &self.bounds_slot {
-            slot.set(Some(bounds));
+            slot.set(Some(self.painted_bounds(bounds, geometry)));
         }
     }
 
@@ -421,13 +474,14 @@ impl Element for MathElement {
         _id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
         bounds: Bounds<Pixels>,
-        _request_layout: &mut Self::RequestLayoutState,
+        geometry: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
         window: &mut Window,
         cx: &mut App,
     ) {
         let color = cx.theme().colors().text;
-        paint_display_list(&self.display_list, bounds, self.em_px, color, window);
+        let painted = self.painted_bounds(bounds, geometry);
+        paint_display_list(&self.display_list, painted, geometry.em_px, color, window);
     }
 }
 
