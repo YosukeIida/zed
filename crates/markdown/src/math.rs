@@ -10,8 +10,8 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AbsoluteLength, App, Bounds, Context, DefiniteLength, Element, Font, FontId as GpuiFontId,
     FontStyle, FontWeight, GlobalElementId, GlyphId, Hsla, InspectorElementId, IntoElement,
-    LayoutId, Length, PathBuilder, Pixels, Point, Rgba, SharedString, Size, Style, Window, fill,
-    font, point, px, size,
+    LayoutId, Length, PathBuilder, Pixels, Point, Rgba, SharedString, Size, Style, TextStyle,
+    Window, fill, font, point, px, size,
 };
 use ratex_types::{Color, DisplayItem, DisplayList, PathCommand};
 use std::borrow::Cow;
@@ -113,6 +113,36 @@ fn parse_to_display_list(latex: &str, display: bool) -> anyhow::Result<DisplayLi
 /// Horizontal gap (in em) inserted before each fragment after the first to approximate the
 /// inter-operator spacing lost when an inline formula is split for wrapping.
 const INTER_FRAGMENT_EM: f32 = 0.22;
+
+/// The pixel baseline at which inline text of `text_style` paints its glyphs within a line box of
+/// `line_height`, derived from a shaped one-character probe (the platform's shaped-line metrics
+/// differ from raw `FontMetrics`). Shared by [`MathElement`] and the markdown inline flow so their
+/// math and text baselines coincide.
+pub(crate) fn inline_text_baseline(
+    window: &mut Window,
+    text_style: &TextStyle,
+    em_px: Pixels,
+    line_height: Pixels,
+) -> Pixels {
+    let probe = window
+        .text_system()
+        .shape_line("x".into(), em_px, &[text_style.to_run(1)], None);
+    (line_height - probe.ascent - probe.descent) / 2. + probe.ascent
+}
+
+/// Box height an inline formula with the given shared em-extents occupies on a line, matching
+/// [`MathElement::request_layout`]: a formula taller than the line pushes the box bottom down
+/// rather than overflowing. Shared so the inline flow can size rows to the exact laid-out height.
+pub(crate) fn inline_math_box_height(
+    em_px: Pixels,
+    line_height: Pixels,
+    text_baseline: Pixels,
+    tallest_height_em: f32,
+    tallest_depth_em: f32,
+) -> Pixels {
+    let baseline = text_baseline.max(em_px * tallest_height_em);
+    line_height.max(baseline + em_px * tallest_depth_em)
+}
 
 /// Outcome of rendering a block (display) formula.
 pub(crate) enum MathBlock {
@@ -361,6 +391,22 @@ impl MathElement {
         self.bounds_slot = Some(slot);
     }
 
+    /// Horizontal advance (in em) this element occupies when laid out inline: the inter-fragment
+    /// gap plus the formula's natural width. Callers multiply by `em_px` to get pixels. This must
+    /// stay equal to the width returned by [`Element::request_layout`] so an inline flow that
+    /// pre-measures fragment widths and the later laid-out element agree on pen advancement.
+    pub(crate) fn inline_advance_em(&self) -> f32 {
+        self.left_em + self.display_list.width.max(0.0) as f32
+    }
+
+    /// Shared baseline extents (height above, depth below, in em) of this inline fragment's
+    /// formula, or `None` for block math. All fragments of one formula share these, so an inline
+    /// flow can size its row to the formula's real [`inline_math_box_height`].
+    pub(crate) fn inline_line_extents(&self) -> Option<(f32, f32)> {
+        self.line
+            .map(|line| (line.tallest_height_em, line.tallest_depth_em))
+    }
+
     /// The rectangle the display list actually paints into, given the resolved geometry and
     /// this element's layout bounds. It is inset from `bounds` by the baseline/gap offsets and
     /// sized to the formula's natural extent (not the surrounding line box).
@@ -422,13 +468,15 @@ impl Element for MathElement {
             // instead of overflowing, so offsets stay non-negative and nothing escapes a
             // clipping ancestor such as a table cell.
             let line_height = window.pixel_snap(text_style.line_height_in_pixels(rem_size));
-            let probe =
-                window
-                    .text_system()
-                    .shape_line("x".into(), em_px, &[text_style.to_run(1)], None);
-            let text_baseline = (line_height - probe.ascent - probe.descent) / 2. + probe.ascent;
+            let text_baseline = inline_text_baseline(window, &text_style, em_px, line_height);
+            let box_height = inline_math_box_height(
+                em_px,
+                line_height,
+                text_baseline,
+                line.tallest_height_em,
+                line.tallest_depth_em,
+            );
             let baseline = text_baseline.max(em_px * line.tallest_height_em);
-            let box_height = line_height.max(baseline + em_px * line.tallest_depth_em);
             let top = baseline - em_px * self.display_list.height.max(0.0) as f32;
             (top, box_height)
         } else {

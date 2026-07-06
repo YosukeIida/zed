@@ -12,18 +12,21 @@ use gpui::UnderlineStyle;
 use language::LanguageName;
 
 use log::Level;
-use math::{MathBlock, MathBoundsSlot, MathInline, MathState, render_math_block, render_math_inline};
+use math::{
+    MathBlock, MathBoundsSlot, MathElement, MathInline, MathState, inline_math_box_height,
+    inline_text_baseline, render_math_block, render_math_inline,
+};
 use mermaid::{
     MermaidState, ParsedMarkdownMermaidDiagram, extract_mermaid_diagrams, render_mermaid_diagram,
 };
 pub use path_range::{LineCol, PathWithRange};
 use settings::Settings as _;
-use smallvec::SmallVec;
 use theme_settings::ThemeSettings;
 use util::maybe;
 
 use std::borrow::Cow;
 use std::cell::Cell;
+use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::mem;
 use std::ops::Range;
@@ -36,10 +39,11 @@ use collections::{HashMap, HashSet};
 use gpui::{
     AnyElement, App, BorderStyle, Bounds, ClipboardItem, CursorStyle, DispatchPhase, Edges, Entity,
     FocusHandle, Focusable, FontStyle, FontWeight, GlobalElementId, Hitbox, Hsla, Image,
-    ImageFormat, ImageSource, KeyContext, Length, MouseButton, MouseDownEvent, MouseEvent,
-    MouseMoveEvent, MouseUpEvent, Point, ScrollHandle, Stateful, StrikethroughStyle,
-    StyleRefinement, StyledImage, StyledText, Subscription, Task, TextAlign, TextLayout, TextRun,
-    TextStyle, TextStyleRefinement, WrappedLineLayout, actions, img, point, quad,
+    ImageFormat, ImageSource, InspectorElementId, KeyContext, LayoutId, Length, LineFragment,
+    MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle,
+    ShapedLine, Size, Stateful, StrikethroughStyle, StyleRefinement, StyledImage, StyledText,
+    Subscription, Task, TextAlign, TextLayout, TextRun, TextStyle, TextStyleRefinement, actions,
+    img, point, quad,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
@@ -1468,23 +1472,12 @@ impl MarkdownElement {
             }
         } else {
             match render_math_inline(math_state, latex) {
-                // Each fragment is its own flex item so the line can wrap between them; each
-                // fragment carries its own baseline offset and inter-fragment gap (in em,
-                // resolved at layout), so no wrapping div is needed. A single invisible source
-                // anchor (for the whole `$...$`) makes the formula copyable.
+                // Embed the formula's fragments into the current line's text as one atomic span so
+                // an `InlineFlowElement` flows text and math on shared wrapped rows (the formula
+                // sits after the text before it). The span's stand-in text is the verbatim `$...$`
+                // source, which makes the formula copyable in source order.
                 MathInline::Fragments(fragments) => {
-                    builder.flush_text();
-                    let anchor = builder
-                        .render_copyable_source_anchor(&source[range.clone()], range.clone());
-                    builder.push_image_child(anchor);
-                    let mut bounds_cells = Vec::with_capacity(fragments.len());
-                    for mut fragment in fragments {
-                        let slot: MathBoundsSlot = Rc::new(Cell::new(None));
-                        fragment.set_bounds_slot(slot.clone());
-                        bounds_cells.push(slot);
-                        builder.push_image_child(fragment);
-                    }
-                    builder.push_math_region(range, bounds_cells);
+                    builder.push_inline_math_span(&source[range.clone()], range, fragments);
                 }
                 MathInline::Error(message) => {
                     self.push_math_error(builder, &message, range, error_color)
@@ -1909,13 +1902,19 @@ impl MarkdownElement {
                                 Ok(ix) | Err(ix) => ix,
                             };
                             // Double-clicking a drawn formula should select the whole formula
-                            // (atomic). The preview binds double-click to "jump editor to source"
-                            // (on_source_click returns blocked); let that run, but for math keep our
-                            // own formula selection instead of clearing it the way we do for text.
-                            let clicked_math = rendered_text
+                            // (atomic). Decide "on a formula" by the click POSITION (its painted
+                            // bounds), not by the resolved source index: a right-half click resolves
+                            // to the formula's end index, which is also the start index of any text
+                            // immediately following it, so an index test would select the formula
+                            // when the user clicked the adjacent word. The preview binds double-click
+                            // to "jump editor to source" (on_source_click returns blocked); let that
+                            // run, but for math keep our own formula selection instead of clearing it.
+                            let clicked_math_range = rendered_text
                                 .math_regions
                                 .iter()
-                                .any(|region| region.touches_index(source_index));
+                                .find(|region| region.bounds_containing(event.position).is_some())
+                                .map(|region| region.source_range.clone());
+                            let clicked_math = clicked_math_range.is_some();
                             if let Some(handler) = on_source_click.as_ref() {
                                 let blocked = handler(source_index, event.click_count, window, cx);
                                 if blocked && !clicked_math {
@@ -1942,11 +1941,15 @@ impl MarkdownElement {
                                     (range, SelectMode::Character, false)
                                 }
                                 2 => {
-                                    let range = rendered_text.surrounding_word_range(source_index);
+                                    let range = clicked_math_range.unwrap_or_else(|| {
+                                        rendered_text.surrounding_word_range(source_index)
+                                    });
                                     (range.clone(), SelectMode::Word(range), false)
                                 }
                                 3 => {
-                                    let range = rendered_text.surrounding_line_range(source_index);
+                                    let range = clicked_math_range.unwrap_or_else(|| {
+                                        rendered_text.surrounding_line_range(source_index)
+                                    });
                                     (range.clone(), SelectMode::Line(range), false)
                                 }
                                 _ => {
@@ -3263,6 +3266,9 @@ struct PendingLine {
     text: String,
     runs: Vec<TextRun>,
     source_mappings: Vec<SourceMapping>,
+    /// Drawn inline formulas embedded in this line's text. When non-empty, `flush_text` emits an
+    /// [`InlineFlowElement`] (text and math on shared wrapped rows) instead of a `StyledText`.
+    math_spans: Vec<MathSpan>,
 }
 
 struct ListStackEntry {
@@ -3356,9 +3362,19 @@ impl MarkdownElementBuilder {
         self.push_div(div().pl_4(), range, markdown_end);
     }
 
-    fn push_image_child(&mut self, child: impl IntoElement) {
+    /// Switch the current div into flex-wrap mode (a flex row that wraps) and flush any pending
+    /// text first. Setting the mode *before* the flush is what lets the run preceding the child
+    /// — e.g. the text before the *first* inline formula or image — be emitted as a wrappable
+    /// flex item rather than a bare `StyledText` that overflows the container. Idempotent.
+    fn begin_flex_wrap(&mut self) {
+        if let Some(entry) = self.div_stack.last_mut() {
+            entry.line_break_mode = LineBreakMode::FlexWrap;
+        }
         self.modify_current_div(|el| el.flex().flex_row().flex_wrap().items_start());
-        self.div_stack.last_mut().unwrap().line_break_mode = LineBreakMode::FlexWrap;
+    }
+
+    fn push_image_child(&mut self, child: impl IntoElement) {
+        self.begin_flex_wrap();
         self.append_child(child.into_any_element());
     }
 
@@ -3523,6 +3539,53 @@ impl MarkdownElementBuilder {
         }
     }
 
+    /// Embed a drawn inline formula into the pending line. `source_text` is the verbatim `$...$`
+    /// source (its byte length must equal `source_range.len()`); `elements` are the formula's
+    /// fragments. The source is appended as the span's stand-in text so selection/copy read it in
+    /// order, a placeholder run keeps run coverage contiguous (these bytes are never shaped), and a
+    /// `MathRegion` records the atomic source span plus the fragments' painted-bounds slots.
+    fn push_inline_math_span(
+        &mut self,
+        source_text: &str,
+        source_range: Range<usize>,
+        mut elements: Vec<MathElement>,
+    ) {
+        let mut bounds_cells = Vec::with_capacity(elements.len());
+        for element in &mut elements {
+            let slot: MathBoundsSlot = Rc::new(Cell::new(None));
+            element.set_bounds_slot(slot.clone());
+            bounds_cells.push(slot);
+        }
+        self.push_math_region(source_range.clone(), bounds_cells);
+
+        let advance_em: f32 = elements.iter().map(MathElement::inline_advance_em).sum();
+        // All fragments of one formula share the same baseline extents; `max` collapses to that.
+        let (ascent_em, descent_em) = elements
+            .iter()
+            .filter_map(MathElement::inline_line_extents)
+            .fold((0.0_f32, 0.0_f32), |(ascent, depth), (height, deep)| {
+                (ascent.max(height), depth.max(deep))
+            });
+
+        let byte_start = self.pending_line.text.len();
+        self.pending_line.source_mappings.push(SourceMapping {
+            rendered_index: byte_start,
+            source_index: source_range.start,
+        });
+        self.pending_line.text.push_str(source_text);
+        self.pending_line
+            .runs
+            .push(self.text_style().to_run(source_text.len()));
+        self.current_source_index = source_range.end;
+        self.pending_line.math_spans.push(MathSpan {
+            byte_range: byte_start..byte_start + source_text.len(),
+            elements,
+            advance_em,
+            ascent_em,
+            descent_em,
+        });
+    }
+
     fn trim_trailing_newline(&mut self) {
         if self.pending_line.text.ends_with('\n') {
             self.pending_line
@@ -3596,7 +3659,7 @@ impl MarkdownElementBuilder {
         let text = "\u{200B}";
         let styled_text = StyledText::new(text).with_runs(vec![text_style.to_run(text.len())]);
         self.rendered_lines.push(RenderedLine {
-            layout: styled_text.layout().clone(),
+            layout: LineGeometry::Text(styled_text.layout().clone()),
             source_mappings: vec![SourceMapping {
                 rendered_index: 0,
                 source_index: source_range.start,
@@ -3629,7 +3692,7 @@ impl MarkdownElementBuilder {
         let styled_text = StyledText::new(source_text.to_string())
             .with_runs(vec![text_style.to_run(source_text.len())]);
         self.rendered_lines.push(RenderedLine {
-            layout: styled_text.layout().clone(),
+            layout: LineGeometry::Text(styled_text.layout().clone()),
             source_mappings: vec![SourceMapping {
                 rendered_index: 0,
                 source_index: source_range.start,
@@ -3664,16 +3727,54 @@ impl MarkdownElementBuilder {
             return;
         }
 
+        // A line carrying drawn inline formulas flows text and math on shared wrapped rows via a
+        // custom element, so a formula sits after the text before it. Plain lines stay on the
+        // `StyledText` path unchanged.
+        if !line.math_spans.is_empty() {
+            let layout = InlineFlowLayout::default();
+            self.rendered_lines.push(RenderedLine {
+                layout: LineGeometry::InlineFlow(layout.clone()),
+                source_mappings: line.source_mappings,
+                source_end: self.current_source_index,
+                language: self.code_block_stack.last().cloned().flatten(),
+                text_align,
+                is_math_anchor: false,
+            });
+            self.append_child(
+                InlineFlowElement {
+                    text: SharedString::from(line.text),
+                    runs: line.runs,
+                    math_spans: line.math_spans,
+                    text_align,
+                    layout,
+                    laid_out_math: Vec::new(),
+                }
+                .into_any_element(),
+            );
+            return;
+        }
+
         let text = StyledText::new(line.text).with_runs(line.runs);
         self.rendered_lines.push(RenderedLine {
-            layout: text.layout().clone(),
+            layout: LineGeometry::Text(text.layout().clone()),
             source_mappings: line.source_mappings,
             source_end: self.current_source_index,
             language: self.code_block_stack.last().cloned().flatten(),
             text_align,
             is_math_anchor: false,
         });
-        self.append_child(text.into_any());
+        // In flex-wrap mode each text run is an independent flex item. `StyledText` only
+        // wraps when it is handed a definite width (see `TextLayout::layout`), and taffy
+        // won't shrink a lone over-wide item on its own, so `max_w_full` clamps the item to
+        // the container width and forces the wrap; `min_w_0` lets it shrink further if
+        // needed. Short runs stay below the cap and sit inline with the math (same idea as
+        // the image path's min_w_0/max_w_full). Plain block layout wraps on its own, so only
+        // constrain the flex-item case.
+        if self.uses_flex_line_breaks() {
+            self.append_child(div().min_w_0().max_w_full().child(text).into_any_element());
+        } else {
+            self.append_child(text.into_any());
+        }
     }
 
     fn build(mut self) -> RenderedMarkdown {
@@ -3691,8 +3792,858 @@ impl MarkdownElementBuilder {
     }
 }
 
+/// Horizontal offset applied to a laid-out segment so it honors the line's text alignment.
+fn alignment_offset(text_align: TextAlign, available_width: Pixels, segment_width: Pixels) -> Pixels {
+    match text_align {
+        TextAlign::Left => px(0.),
+        TextAlign::Center => ((available_width - segment_width) / 2.).max(px(0.)),
+        TextAlign::Right => (available_width - segment_width).max(px(0.)),
+    }
+}
+
+/// A drawn inline formula embedded in an [`InlineFlowElement`]'s text. `byte_range` locates its
+/// stand-in bytes (the verbatim `$...$` source) within the flow's rendered string; `elements` are
+/// the formula's fragments, painted left-to-right; `advance_em`/`ascent_em`/`descent_em` are its
+/// extents in em, resolved to pixels against the cascaded text style at layout time.
+struct MathSpan {
+    byte_range: Range<usize>,
+    elements: Vec<MathElement>,
+    advance_em: f32,
+    /// Shared baseline extents (em) of the formula, used to size a row to the formula's real
+    /// laid-out height (see [`math::inline_math_box_height`]).
+    ascent_em: f32,
+    descent_em: f32,
+}
+
+/// `Clone`able geometry-only view of a [`MathSpan`], captured into the measure closure (which
+/// cannot hold the non-`Clone` [`MathElement`]s).
+#[derive(Clone)]
+struct MathSpanSpec {
+    byte_range: Range<usize>,
+    advance_em: f32,
+    ascent_em: f32,
+    descent_em: f32,
+}
+
+/// Shared, `TextLayout`-like handle for an [`InlineFlowElement`]: filled during measure/prepaint,
+/// read by the selection layer during paint. `bounds` is `None` until the element is prepainted.
+#[derive(Clone, Default)]
+struct InlineFlowLayout(Rc<RefCell<Option<InlineFlowLayoutInner>>>);
+
+struct InlineFlowLayoutInner {
+    /// The flow's full rendered string (surrounding text with each formula's `$...$` source
+    /// standing in for the drawn glyphs), so selection/copy read the source in order.
+    text: SharedString,
+    rows: Vec<VisualRow>,
+    len: usize,
+    line_height: Pixels,
+    size: Size<Pixels>,
+    /// Absolute bounds, set during prepaint; the rows' `top` is relative to `bounds.origin`.
+    bounds: Option<Bounds<Pixels>>,
+    wrap_width: Option<Pixels>,
+    text_align: TextAlign,
+}
+
+/// One visual (wrapped) row of an inline flow. `top` is relative to the element origin.
+struct VisualRow {
+    top: Pixels,
+    height: Pixels,
+    /// Content width (sum of piece widths), used to honor text alignment.
+    width: Pixels,
+    byte_start: usize,
+    byte_end: usize,
+    pieces: Vec<RowPiece>,
+}
+
+/// A run of shaped text or a reserved gap for a drawn formula, within a [`VisualRow`]. `x` is the
+/// piece's offset from the row's content start (before the alignment offset is applied).
+enum RowPiece {
+    Text {
+        shaped: ShapedLine,
+        byte_start: usize,
+        x: Pixels,
+    },
+    Math {
+        byte_start: usize,
+        byte_len: usize,
+        width: Pixels,
+        span_ix: usize,
+        x: Pixels,
+    },
+}
+
+impl InlineFlowLayout {
+    fn len(&self) -> usize {
+        self.0.borrow().as_ref().map_or(0, |inner| inner.len)
+    }
+
+    fn line_height(&self) -> Pixels {
+        self.0.borrow().as_ref().map_or(px(0.), |inner| inner.line_height)
+    }
+
+    fn bounds(&self) -> Bounds<Pixels> {
+        self.0
+            .borrow()
+            .as_ref()
+            .and_then(|inner| inner.bounds)
+            .unwrap_or_default()
+    }
+
+    fn text(&self) -> String {
+        self.0
+            .borrow()
+            .as_ref()
+            .map_or(String::new(), |inner| inner.text.to_string())
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn wrapped_text(&self) -> String {
+        let borrow = self.0.borrow();
+        let Some(inner) = borrow.as_ref() else {
+            return String::new();
+        };
+        let mut out = String::new();
+        for (ix, row) in inner.rows.iter().enumerate() {
+            if ix > 0 {
+                out.push('\n');
+            }
+            out.push_str(inner.text[row.byte_start..row.byte_end].trim_end_matches('\n'));
+        }
+        out
+    }
+
+    fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        let borrow = self.0.borrow();
+        let inner = borrow.as_ref()?;
+        let bounds = inner.bounds?;
+        for row in &inner.rows {
+            if index < row.byte_start || index > row.byte_end {
+                continue;
+            }
+            let row_top = bounds.top() + row.top;
+            let align = alignment_offset(inner.text_align, bounds.size.width, row.width);
+            for piece in &row.pieces {
+                match piece {
+                    RowPiece::Text {
+                        shaped,
+                        byte_start,
+                        x,
+                    } => {
+                        let end = byte_start + shaped.len();
+                        if index >= *byte_start && index <= end {
+                            let local = index - byte_start;
+                            return Some(point(
+                                bounds.left() + align + *x + shaped.x_for_index(local),
+                                row_top,
+                            ));
+                        }
+                    }
+                    RowPiece::Math {
+                        byte_start,
+                        byte_len,
+                        x,
+                        ..
+                    } => {
+                        if index >= *byte_start && index <= byte_start + byte_len {
+                            return Some(point(bounds.left() + align + *x, row_top));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Rendered-index hit-test for a point, honoring alignment. `Ok` when the point lands on a
+    /// piece, `Err` (with the nearest index) when it falls in empty space.
+    fn rendered_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        text_align: TextAlign,
+    ) -> Result<usize, usize> {
+        let borrow = self.0.borrow();
+        let Some(inner) = borrow.as_ref() else {
+            return Err(0);
+        };
+        let Some(bounds) = inner.bounds else {
+            return Err(0);
+        };
+        let relative_y = (position.y - bounds.top()).max(px(0.));
+        let row = inner
+            .rows
+            .iter()
+            .find(|row| relative_y < row.top + row.height)
+            .or_else(|| inner.rows.last());
+        let Some(row) = row else {
+            return Err(inner.len);
+        };
+        let align = alignment_offset(text_align, bounds.size.width, row.width);
+        let local_x = position.x - bounds.left() - align;
+        let mut last_end = row.byte_start;
+        for piece in &row.pieces {
+            match piece {
+                RowPiece::Text {
+                    shaped,
+                    byte_start,
+                    x,
+                } => {
+                    let piece_end_x = *x + shaped.width();
+                    if local_x < piece_end_x {
+                        let piece_local_x = (local_x - *x).max(px(0.));
+                        let index = shaped
+                            .index_for_x(piece_local_x)
+                            .unwrap_or_else(|| shaped.closest_index_for_x(piece_local_x));
+                        return Ok(byte_start + index);
+                    }
+                    last_end = byte_start + shaped.len();
+                }
+                RowPiece::Math {
+                    byte_start,
+                    byte_len,
+                    width,
+                    x,
+                    ..
+                } => {
+                    if local_x < *x + *width {
+                        // Split the whole reserved math box left/right, mirroring the
+                        // painted-glyph-bounds split in `RenderedText::source_index_for_position`,
+                        // so a click resolves consistently whether it lands on the glyphs or in the
+                        // surrounding line-height / inter-fragment padding.
+                        let center = *x + *width / 2.;
+                        return Ok(if local_x < center {
+                            *byte_start
+                        } else {
+                            byte_start + byte_len
+                        });
+                    }
+                    last_end = byte_start + byte_len;
+                }
+            }
+        }
+        Err(last_end)
+    }
+
+    /// Highlight rectangles for a rendered-index range. Skips [`RowPiece::Math`] pieces; the
+    /// formula's painted bounds (from its `MathRegion`) provide math highlights instead.
+    fn highlight_bounds(&self, range: Range<usize>, text_align: TextAlign) -> Vec<Bounds<Pixels>> {
+        let mut out = Vec::new();
+        let borrow = self.0.borrow();
+        let Some(inner) = borrow.as_ref() else {
+            return out;
+        };
+        let Some(bounds) = inner.bounds else {
+            return out;
+        };
+        for row in &inner.rows {
+            let row_top = bounds.top() + row.top;
+            let align = alignment_offset(text_align, bounds.size.width, row.width);
+            for piece in &row.pieces {
+                let RowPiece::Text {
+                    shaped,
+                    byte_start,
+                    x,
+                } = piece
+                else {
+                    continue;
+                };
+                let piece_end = byte_start + shaped.len();
+                let selection_start = range.start.max(*byte_start);
+                let selection_end = range.end.min(piece_end);
+                if selection_start < selection_end {
+                    let x0 = bounds.left()
+                        + align
+                        + *x
+                        + shaped.x_for_index(selection_start - byte_start);
+                    let x1 = bounds.left()
+                        + align
+                        + *x
+                        + shaped.x_for_index(selection_end - byte_start);
+                    out.push(Bounds::from_corners(
+                        point(x0, row_top),
+                        point(x1, row_top + inner.line_height),
+                    ));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The rendered geometry of a [`RenderedLine`]: plain text uses GPUI's [`TextLayout`]; a line that
+/// mixes text and drawn inline math uses an [`InlineFlowElement`]'s shared [`InlineFlowLayout`].
+/// Both answer the same selection/copy queries so the selection layer treats them uniformly.
+enum LineGeometry {
+    Text(TextLayout),
+    InlineFlow(InlineFlowLayout),
+}
+
+impl LineGeometry {
+    fn len(&self) -> usize {
+        match self {
+            LineGeometry::Text(layout) => layout.len(),
+            LineGeometry::InlineFlow(flow) => flow.len(),
+        }
+    }
+
+    fn bounds(&self) -> Bounds<Pixels> {
+        match self {
+            LineGeometry::Text(layout) => layout.bounds(),
+            LineGeometry::InlineFlow(flow) => flow.bounds(),
+        }
+    }
+
+    fn line_height(&self) -> Pixels {
+        match self {
+            LineGeometry::Text(layout) => layout.line_height(),
+            LineGeometry::InlineFlow(flow) => flow.line_height(),
+        }
+    }
+
+    fn text(&self) -> String {
+        match self {
+            LineGeometry::Text(layout) => layout.text(),
+            LineGeometry::InlineFlow(flow) => flow.text(),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn wrapped_text(&self) -> String {
+        match self {
+            LineGeometry::Text(layout) => layout.wrapped_text(),
+            LineGeometry::InlineFlow(flow) => flow.wrapped_text(),
+        }
+    }
+
+    fn position_for_index(&self, index: usize) -> Option<Point<Pixels>> {
+        match self {
+            LineGeometry::Text(layout) => layout.position_for_index(index),
+            LineGeometry::InlineFlow(flow) => flow.position_for_index(index),
+        }
+    }
+
+    /// Rendered-index hit-test for a point, honoring the line's text alignment.
+    fn rendered_index_for_position(
+        &self,
+        position: Point<Pixels>,
+        text_align: TextAlign,
+    ) -> Result<usize, usize> {
+        match self {
+            LineGeometry::Text(layout) => text_layout_index_for_position(layout, position, text_align),
+            LineGeometry::InlineFlow(flow) => flow.rendered_index_for_position(position, text_align),
+        }
+    }
+
+    /// Highlight rectangles for a rendered-index range within this line.
+    fn highlight_bounds(&self, range: Range<usize>, text_align: TextAlign) -> Vec<Bounds<Pixels>> {
+        match self {
+            LineGeometry::Text(layout) => {
+                text_layout_highlight_bounds(layout, range, text_align)
+            }
+            LineGeometry::InlineFlow(flow) => flow.highlight_bounds(range, text_align),
+        }
+    }
+}
+
+/// Alignment-adjusted rendered-index hit-test for a plain [`TextLayout`] line (extracted from the
+/// former `RenderedLine::source_index_for_position` so both geometry kinds share the call site).
+fn text_layout_index_for_position(
+    layout: &TextLayout,
+    position: Point<Pixels>,
+    text_align: TextAlign,
+) -> Result<usize, usize> {
+    let adjusted_position = maybe!({
+        if text_align == TextAlign::Left {
+            return None;
+        }
+        let wrapped_line = layout.line_layout_for_index(0)?;
+        let bounds = layout.bounds();
+        let line_height = layout.line_height();
+        let relative_y = (position.y - bounds.top()).max(px(0.));
+        let wrapped_row_ix = (relative_y / line_height) as usize;
+        let boundaries = wrapped_line.wrap_boundaries();
+        let segment_start_x = if wrapped_row_ix == 0 {
+            px(0.)
+        } else {
+            boundaries
+                .get(wrapped_row_ix - 1)
+                .map(|b| wrapped_line.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix].position.x)
+                .unwrap_or(px(0.))
+        };
+        let segment_end_x = boundaries
+            .get(wrapped_row_ix)
+            .map(|b| wrapped_line.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix].position.x)
+            .unwrap_or(wrapped_line.unwrapped_layout.width);
+        let offset =
+            alignment_offset(text_align, bounds.size.width, segment_end_x - segment_start_x);
+        Some(point(position.x - offset, position.y))
+    })
+    .unwrap_or(position);
+
+    layout.index_for_position(adjusted_position)
+}
+
+/// Highlight rectangles for a rendered-index range within a plain [`TextLayout`] line (extracted
+/// from the former `RenderedText::wrapped_line_segments`/`push_bounds_for_line_source_range`).
+fn text_layout_highlight_bounds(
+    layout: &TextLayout,
+    range: Range<usize>,
+    text_align: TextAlign,
+) -> Vec<Bounds<Pixels>> {
+    let mut out = Vec::new();
+    if range.start >= range.end {
+        return out;
+    }
+    let line_bounds = layout.bounds();
+    let line_height = layout.line_height();
+
+    let mut wrapped_line_start = 0;
+    let mut row_top = line_bounds.top();
+    for wrapped_line in layout.line_layouts() {
+        let wrapped_line_end = wrapped_line_start + wrapped_line.len();
+        let unwrapped_layout = &wrapped_line.unwrapped_layout;
+
+        if wrapped_line_start < range.end && range.start < wrapped_line_end {
+            let row_ends = wrapped_line
+                .wrap_boundaries()
+                .iter()
+                .map(|wrap_boundary| {
+                    let glyph =
+                        &unwrapped_layout.runs[wrap_boundary.run_ix].glyphs[wrap_boundary.glyph_ix];
+                    (wrapped_line_start + glyph.index, glyph.position.x)
+                })
+                .chain([(wrapped_line_end, unwrapped_layout.width)]);
+
+            let mut sub_row_start = wrapped_line_start;
+            let mut sub_row_start_x = Pixels::ZERO;
+            let mut sub_row_top = row_top;
+            for (row_end, row_end_x) in row_ends {
+                let selection_start = range.start.max(sub_row_start);
+                let selection_end = range.end.min(row_end);
+                if selection_start < selection_end {
+                    let offset =
+                        alignment_offset(text_align, line_bounds.size.width, row_end_x - sub_row_start_x);
+                    let x_for_index = |index: usize| {
+                        line_bounds.left() + offset
+                            + unwrapped_layout.x_for_index(index - wrapped_line_start)
+                            - sub_row_start_x
+                    };
+                    out.push(Bounds::from_corners(
+                        point(x_for_index(selection_start), sub_row_top),
+                        point(x_for_index(selection_end), sub_row_top + line_height),
+                    ));
+                }
+                sub_row_start = row_end;
+                sub_row_start_x = row_end_x;
+                sub_row_top += line_height;
+            }
+        }
+
+        row_top += wrapped_line.size(line_height).height;
+        wrapped_line_start = wrapped_line_end + 1;
+    }
+    out
+}
+
+/// Extract the sub-runs of `runs` (which cover the whole flow text) that fall within `range`,
+/// splitting any run that straddles a boundary. Used to shape a row's text slice with the right
+/// styles.
+fn slice_runs(runs: &[TextRun], range: Range<usize>) -> Vec<TextRun> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    for run in runs {
+        let run_start = pos;
+        let run_end = pos + run.len;
+        pos = run_end;
+        let start = run_start.max(range.start);
+        let end = run_end.min(range.end);
+        if start < end {
+            let mut sliced = run.clone();
+            sliced.len = end - start;
+            out.push(sliced);
+        }
+        if run_end >= range.end {
+            break;
+        }
+    }
+    out
+}
+
+/// A custom element that flows surrounding text and drawn inline math on the same wrapped lines,
+/// so a formula sits right after the text before it (like KaTeX/LaTeX inline math) instead of
+/// being pushed to the start of the next line by flexbox item wrapping. Only inline runs that
+/// contain at least one drawn formula use this element; plain paragraphs keep the `StyledText`
+/// path unchanged.
+struct InlineFlowElement {
+    text: SharedString,
+    runs: Vec<TextRun>,
+    math_spans: Vec<MathSpan>,
+    text_align: TextAlign,
+    layout: InlineFlowLayout,
+    /// Formula fragment elements, built in prepaint from `math_spans` and painted in paint.
+    laid_out_math: Vec<AnyElement>,
+}
+
+impl IntoElement for InlineFlowElement {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+impl Element for InlineFlowElement {
+    type RequestLayoutState = ();
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<gpui::ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static std::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        _cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let text = self.text.clone();
+        let runs = self.runs.clone();
+        let text_align = self.text_align;
+        let specs: Vec<MathSpanSpec> = self
+            .math_spans
+            .iter()
+            .map(|span| MathSpanSpec {
+                byte_range: span.byte_range.clone(),
+                advance_em: span.advance_em,
+                ascent_em: span.ascent_em,
+                descent_em: span.descent_em,
+            })
+            .collect();
+        let layout = self.layout.clone();
+        // Capture the cascaded text style now, while the enclosing div's style is active. The
+        // measure closure runs later (during compute_layout), when `window.text_style()` would
+        // return the default style — so a formula-bearing line would otherwise shape its text at
+        // the base font size and fail to scale with zoom (while the math, laid out in prepaint
+        // where the cascaded style *is* active, does scale). `StyledText::layout` captures the
+        // style for the same reason.
+        let text_style = window.text_style();
+        let rem_size = window.rem_size();
+
+        let layout_id = window.request_measured_layout(gpui::Style::default(), {
+            move |known_dimensions, available_space, window, cx| {
+                let em_px = text_style.font_size.to_pixels(rem_size);
+                // Match `MathElement::request_layout` exactly (it uses `line_height_in_pixels`,
+                // which rounds) so a row's height and text baseline coincide with the formula's
+                // laid-out box to the pixel; `line_height.to_pixels` omits that rounding.
+                let line_height = window.pixel_snap(text_style.line_height_in_pixels(rem_size));
+                let wrap_width = known_dimensions.width.or(match available_space.width {
+                    gpui::AvailableSpace::Definite(width) => Some(width),
+                    _ => None,
+                });
+
+                if let Some(size) = {
+                    let borrow = layout.0.borrow();
+                    borrow
+                        .as_ref()
+                        .filter(|inner| inner.wrap_width == wrap_width)
+                        .map(|inner| inner.size)
+                } {
+                    return size;
+                }
+
+                // Baseline where this line's text paints, so a row can be sized to the exact
+                // height a formula's `MathElement` will occupy (same probe the element uses).
+                let text_baseline = inline_text_baseline(window, &text_style, em_px, line_height);
+                let rows = layout_inline_flow_rows(
+                    &text,
+                    &runs,
+                    &specs,
+                    text_style.font(),
+                    em_px,
+                    line_height,
+                    text_baseline,
+                    wrap_width,
+                    window,
+                    cx,
+                );
+
+                let mut size = Size::<Pixels>::default();
+                for row in &rows {
+                    size.width = size.width.max(row.width);
+                    size.height += row.height;
+                }
+                size.width = size.width.ceil();
+
+                layout.0.borrow_mut().replace(InlineFlowLayoutInner {
+                    text: text.clone(),
+                    rows,
+                    len: text.len(),
+                    line_height,
+                    size,
+                    bounds: None,
+                    wrap_width,
+                    text_align,
+                });
+                size
+            }
+        });
+        (layout_id, ())
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        // Record the absolute bounds so the (relative) row tops resolve to screen coordinates for
+        // selection queries, and lay out/position each formula's fragments at their pen origin.
+        let mut placements: Vec<(usize, Point<Pixels>)> = Vec::new();
+        {
+            let borrow = self.layout.0.borrow();
+            let Some(inner) = borrow.as_ref() else {
+                return;
+            };
+            for row in &inner.rows {
+                let row_top = bounds.top() + row.top;
+                let align = alignment_offset(self.text_align, bounds.size.width, row.width);
+                for piece in &row.pieces {
+                    if let RowPiece::Math { span_ix, x, .. } = piece {
+                        placements.push((*span_ix, point(bounds.left() + align + *x, row_top)));
+                    }
+                }
+            }
+        }
+        self.layout.0.borrow_mut().as_mut().unwrap().bounds = Some(bounds);
+
+        let em_px = window.text_style().font_size.to_pixels(window.rem_size());
+        let mut laid_out = Vec::new();
+        for (span_ix, origin) in placements {
+            let elements = std::mem::take(&mut self.math_spans[span_ix].elements);
+            let mut cursor_x = origin.x;
+            for element in elements {
+                let advance = em_px * element.inline_advance_em();
+                let mut any = element.into_any_element();
+                any.layout_as_root(gpui::AvailableSpace::min_size(), window, cx);
+                any.prepaint_at(point(cursor_x, origin.y), window, cx);
+                laid_out.push(any);
+                cursor_x += advance;
+            }
+        }
+        self.laid_out_math = laid_out;
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&GlobalElementId>,
+        _inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        _request_layout: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        {
+            let borrow = self.layout.0.borrow();
+            if let Some(inner) = borrow.as_ref() {
+                for row in &inner.rows {
+                    let row_top = bounds.top() + row.top;
+                    let align = alignment_offset(self.text_align, bounds.size.width, row.width);
+                    for piece in &row.pieces {
+                        if let RowPiece::Text { shaped, x, .. } = piece {
+                            shaped
+                                .paint(
+                                    point(bounds.left() + align + *x, row_top),
+                                    inner.line_height,
+                                    TextAlign::Left,
+                                    None,
+                                    window,
+                                    cx,
+                                )
+                                .log_err();
+                        }
+                    }
+                }
+            }
+        }
+        for element in &mut self.laid_out_math {
+            element.paint(window, cx);
+        }
+    }
+}
+
+/// Wrap the flow's text (with each formula reserving a fixed-width, atomic gap) into visual rows,
+/// shaping each row's text slices. Mirrors the editor's `LineWithInvisibles`/`wrap_map` approach:
+/// [`gpui::LineWrapper::wrap_line`] computes break points across a mix of text and element
+/// fragments, then each row's text is shaped with [`WindowTextSystem::shape_line`].
+fn layout_inline_flow_rows(
+    text: &SharedString,
+    runs: &[TextRun],
+    specs: &[MathSpanSpec],
+    font: gpui::Font,
+    em_px: Pixels,
+    line_height: Pixels,
+    text_baseline: Pixels,
+    wrap_width: Option<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Vec<VisualRow> {
+    // Segment the text into maximal non-math runs and atomic math spans, in byte order.
+    enum Seg {
+        Text(Range<usize>),
+        Math(usize),
+    }
+    let mut segments = Vec::new();
+    let mut cursor = 0usize;
+    for (spec_ix, spec) in specs.iter().enumerate() {
+        if spec.byte_range.start > cursor {
+            segments.push(Seg::Text(cursor..spec.byte_range.start));
+        }
+        segments.push(Seg::Math(spec_ix));
+        cursor = spec.byte_range.end;
+    }
+    if cursor < text.len() {
+        segments.push(Seg::Text(cursor..text.len()));
+    }
+
+    // Compute wrap boundaries (byte indices where a new row starts) over the mixed fragments.
+    //
+    // Known approximations (both shared with GPUI's plain `StyledText` wrap path):
+    //  - `LineWrapper` measures text with one font's per-character widths, whereas rows are painted
+    //    with per-run shaped widths. For uniform-font text (the common case) these agree; with
+    //    mixed bold/italic/inline-code runs or complex shaping the wrap point can drift slightly.
+    //    A fully faithful fix would wrap on shaped widths, a larger rework.
+    //  - `Boundary::next_indent` (continuation-line indent the wrapper reserves) is not applied to
+    //    the visual rows, matching `StyledText`; it only matters for leading-indented text.
+    let boundaries: Vec<usize> = if let Some(wrap_width) = wrap_width {
+        let mut fragments: Vec<LineFragment> = Vec::new();
+        for segment in &segments {
+            match segment {
+                Seg::Text(range) => fragments.push(LineFragment::text(&text[range.clone()])),
+                Seg::Math(ix) => fragments
+                    .push(LineFragment::element(em_px * specs[*ix].advance_em, specs[*ix].byte_range.len())),
+            }
+        }
+        let mut wrapper = cx.text_system().line_wrapper(font, em_px);
+        let mut boundaries: Vec<usize> = wrapper
+            .wrap_line(&fragments, wrap_width)
+            .map(|boundary| boundary.ix)
+            .collect();
+        // Force a row break right after each hard line break in the source text.
+        for (ix, byte) in text.char_indices() {
+            if byte == '\n' {
+                boundaries.push(ix + 1);
+            }
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+    } else {
+        // No wrapping width: still break at hard line breaks.
+        text.char_indices()
+            .filter(|(_, ch)| *ch == '\n')
+            .map(|(ix, _)| ix + 1)
+            .collect()
+    };
+
+    // Row byte ranges: [0, b0), [b0, b1), ... [bk, len).
+    let mut row_ranges: Vec<Range<usize>> = Vec::new();
+    let mut prev = 0usize;
+    for &boundary in &boundaries {
+        if boundary > prev && boundary <= text.len() {
+            row_ranges.push(prev..boundary);
+            prev = boundary;
+        }
+    }
+    row_ranges.push(prev..text.len());
+
+    let font_size = em_px;
+    let mut rows = Vec::with_capacity(row_ranges.len());
+    let mut row_top = px(0.);
+    for range in row_ranges {
+        let mut pieces = Vec::new();
+        let mut x = px(0.);
+        let mut row_height = line_height;
+        let mut byte = range.start;
+        while byte < range.end {
+            // A math span starting exactly here (spans are atomic and never split across rows).
+            if let Some((span_ix, spec)) = specs
+                .iter()
+                .enumerate()
+                .find(|(_, spec)| spec.byte_range.start == byte)
+            {
+                let width = em_px * spec.advance_em;
+                pieces.push(RowPiece::Math {
+                    byte_start: spec.byte_range.start,
+                    byte_len: spec.byte_range.len(),
+                    width,
+                    span_ix,
+                    x,
+                });
+                x += width;
+                // Size the row to the formula's real laid-out height (baseline-aligned), not just
+                // its natural extent, so a tall formula does not overlap the next row or clip.
+                row_height = row_height.max(inline_math_box_height(
+                    em_px,
+                    line_height,
+                    text_baseline,
+                    spec.ascent_em,
+                    spec.descent_em,
+                ));
+                byte = spec.byte_range.end.min(range.end);
+                continue;
+            }
+
+            // Otherwise a text slice up to the next math span (or row end).
+            let next_math = specs
+                .iter()
+                .filter(|spec| spec.byte_range.start > byte && spec.byte_range.start < range.end)
+                .map(|spec| spec.byte_range.start)
+                .min()
+                .unwrap_or(range.end);
+            // Strip a trailing hard break and never feed `\n` to `shape_line`.
+            let slice = &text[byte..next_math];
+            let slice = slice.split('\n').next().unwrap_or("");
+            if !slice.is_empty() {
+                let sub_runs = slice_runs(runs, byte..byte + slice.len());
+                let shaped = window.text_system().shape_line(
+                    SharedString::from(slice.to_string()),
+                    font_size,
+                    &sub_runs,
+                    None,
+                );
+                let width = shaped.width();
+                pieces.push(RowPiece::Text {
+                    shaped,
+                    byte_start: byte,
+                    x,
+                });
+                x += width;
+            }
+            byte = next_math;
+        }
+        rows.push(VisualRow {
+            top: row_top,
+            height: row_height,
+            width: x,
+            byte_start: range.start,
+            byte_end: range.end,
+            pieces,
+        });
+        row_top += row_height;
+    }
+    rows
+}
+
 struct RenderedLine {
-    layout: TextLayout,
+    layout: LineGeometry,
     source_mappings: Vec<SourceMapping>,
     source_end: usize,
     language: Option<Arc<Language>>,
@@ -3768,78 +4719,12 @@ impl RenderedLine {
         self.source_mappings[ix].source_index
     }
 
-    fn alignment_offset_for_segment(
-        &self,
-        available_width: Pixels,
-        segment_start_x: Pixels,
-        segment_end_x: Pixels,
-    ) -> Pixels {
-        let segment_width = segment_end_x - segment_start_x;
-        match self.text_align {
-            TextAlign::Left => px(0.),
-            TextAlign::Center => ((available_width - segment_width) / 2.).max(px(0.)),
-            TextAlign::Right => (available_width - segment_width).max(px(0.)),
-        }
-    }
-
     fn source_index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
-        let adjusted_position = maybe!({
-            if self.text_align == TextAlign::Left {
-                return None;
-            }
-
-            let Some(wrapped_line) = self.layout.line_layout_for_index(0) else {
-                return None;
+        let (line_rendered_index, out_of_bounds) =
+            match self.layout.rendered_index_for_position(position, self.text_align) {
+                Ok(ix) => (ix, false),
+                Err(ix) => (ix, true),
             };
-
-            let bounds = self.layout.bounds();
-            let line_height = self.layout.line_height();
-            let relative_y = (position.y - bounds.top()).max(px(0.));
-            let wrapped_row_ix = (relative_y / line_height) as usize;
-            let boundaries = wrapped_line.wrap_boundaries();
-
-            let segment_start_x = if wrapped_row_ix == 0 {
-                px(0.)
-            } else {
-                boundaries
-                    .get(wrapped_row_ix - 1)
-                    .map(|b| {
-                        wrapped_line.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix]
-                            .position
-                            .x
-                    })
-                    .unwrap_or(px(0.))
-            };
-            let segment_end_x = boundaries
-                .get(wrapped_row_ix)
-                .map(|b| {
-                    wrapped_line.unwrapped_layout.runs[b.run_ix].glyphs[b.glyph_ix]
-                        .position
-                        .x
-                })
-                .unwrap_or(wrapped_line.unwrapped_layout.width);
-
-            let alignment_offset = self.alignment_offset_for_segment(
-                bounds.size.width,
-                segment_start_x,
-                segment_end_x,
-            );
-            Some(point(position.x - alignment_offset, position.y))
-        })
-        .unwrap_or(position);
-
-        let line_rendered_index;
-        let out_of_bounds;
-        match self.layout.index_for_position(adjusted_position) {
-            Ok(ix) => {
-                line_rendered_index = ix;
-                out_of_bounds = false;
-            }
-            Err(ix) => {
-                line_rendered_index = ix;
-                out_of_bounds = true;
-            }
-        };
         let source_index = self.source_index_for_rendered_index(line_rendered_index);
         if out_of_bounds {
             Err(source_index)
@@ -3925,13 +4810,6 @@ struct RenderedText {
     math_regions: Rc<[MathRegion]>,
 }
 
-struct WrappedLineSegment {
-    start: usize,
-    end: usize,
-    row_top: Pixels,
-    layout: Arc<WrappedLineLayout>,
-}
-
 #[derive(Debug, Clone, Eq, PartialEq)]
 struct RenderedLink {
     source_range: Range<usize>,
@@ -3995,23 +4873,23 @@ impl RenderedText {
                 continue;
             }
 
-            let wrapped_line_segments = Self::wrapped_line_segments(line);
-            if wrapped_line_segments.is_empty() {
-                continue;
-            }
-
             let mut range_ix = first_possible_range_ix;
             while let Some((highlight_ix, range)) = ranges.get(range_ix) {
                 if range.start >= line.source_end {
                     break;
                 }
-                Self::push_bounds_for_line_source_range(
-                    &mut all_bounds,
-                    *highlight_ix,
-                    line,
-                    &wrapped_line_segments,
-                    range.start.max(line_source_start)..range.end.min(line.source_end),
-                );
+                let clamped =
+                    range.start.max(line_source_start)..range.end.min(line.source_end);
+                if clamped.start < clamped.end {
+                    let rendered_start = line.rendered_index_for_source_index(clamped.start);
+                    let rendered_end = line.rendered_index_for_source_index(clamped.end);
+                    all_bounds.extend(
+                        line.layout
+                            .highlight_bounds(rendered_start..rendered_end, line.text_align)
+                            .into_iter()
+                            .map(|bounds| (*highlight_ix, bounds)),
+                    );
+                }
                 range_ix += 1;
             }
         }
@@ -4028,106 +4906,6 @@ impl RenderedText {
         }
 
         all_bounds
-    }
-
-    fn wrapped_line_segments(line: &RenderedLine) -> SmallVec<[WrappedLineSegment; 1]> {
-        let layout = &line.layout;
-        let line_height = layout.line_height();
-        let mut row_top = layout.bounds().top();
-        let mut wrapped_line_start = 0;
-        let mut segments = SmallVec::new();
-
-        for wrapped_line in layout.line_layouts() {
-            let wrapped_line_end = wrapped_line_start + wrapped_line.len();
-            let wrapped_line_height = wrapped_line.size(line_height).height;
-            segments.push(WrappedLineSegment {
-                start: wrapped_line_start,
-                end: wrapped_line_end,
-                row_top,
-                layout: wrapped_line,
-            });
-            row_top += wrapped_line_height;
-            wrapped_line_start = wrapped_line_end + 1;
-        }
-
-        segments
-    }
-
-    fn push_bounds_for_line_source_range(
-        all_bounds: &mut Vec<(usize, Bounds<Pixels>)>,
-        highlight_ix: usize,
-        line: &RenderedLine,
-        wrapped_line_segments: &[WrappedLineSegment],
-        range: Range<usize>,
-    ) {
-        if range.start >= range.end {
-            return;
-        }
-
-        let layout = &line.layout;
-        let line_bounds = layout.bounds();
-        let line_height = layout.line_height();
-
-        let rendered_start = line.rendered_index_for_source_index(range.start);
-        let rendered_end = line.rendered_index_for_source_index(range.end);
-
-        for wrapped_line_segment in wrapped_line_segments {
-            if wrapped_line_segment.start >= rendered_end {
-                break;
-            }
-            if wrapped_line_segment.end <= rendered_start {
-                continue;
-            }
-
-            let wrapped_line = &wrapped_line_segment.layout;
-            let unwrapped_layout = &wrapped_line.unwrapped_layout;
-            let wrapped_line_start = wrapped_line_segment.start;
-            let wrapped_line_end = wrapped_line_segment.end;
-            let mut row_top = wrapped_line_segment.row_top;
-
-            let row_ends = wrapped_line
-                .wrap_boundaries()
-                .iter()
-                .map(|wrap_boundary| {
-                    let glyph =
-                        &unwrapped_layout.runs[wrap_boundary.run_ix].glyphs[wrap_boundary.glyph_ix];
-                    (wrapped_line_start + glyph.index, glyph.position.x)
-                })
-                .chain([(wrapped_line_end, unwrapped_layout.width)]);
-
-            let mut row_start = wrapped_line_start;
-            let mut row_start_x = Pixels::ZERO;
-
-            for (row_end, row_end_x) in row_ends {
-                let selection_start = rendered_start.max(row_start);
-                let selection_end = rendered_end.min(row_end);
-
-                if selection_start < selection_end {
-                    let alignment_offset = line.alignment_offset_for_segment(
-                        line_bounds.size.width,
-                        row_start_x,
-                        row_end_x,
-                    );
-                    let x_for_index = |index| {
-                        line_bounds.left()
-                            + alignment_offset
-                            + unwrapped_layout.x_for_index(index - wrapped_line_start)
-                            - row_start_x
-                    };
-                    all_bounds.push((
-                        highlight_ix,
-                        Bounds::from_corners(
-                            point(x_for_index(selection_start), row_top),
-                            point(x_for_index(selection_end), row_top + line_height),
-                        ),
-                    ));
-                }
-
-                row_start = row_end;
-                row_start_x = row_end_x;
-                row_top += line_height;
-            }
-        }
     }
 
     fn source_index_for_position(&self, position: Point<Pixels>) -> Result<usize, usize> {
@@ -5685,7 +6463,10 @@ mod tests {
         let line = &rendered.lines[0];
         let line_bounds = line.layout.bounds();
         let line_height = line.layout.line_height();
-        let wrapped_line = line.layout.line_layout_for_index(0).unwrap();
+        let LineGeometry::Text(text_layout) = &line.layout else {
+            panic!("a math-free paragraph should render as a plain-text line");
+        };
+        let wrapped_line = text_layout.line_layout_for_index(0).unwrap();
         let visual_row_count = wrapped_line.wrap_boundaries().len() + 1;
 
         let highlight_bounds = rendered.bounds_for_source_range(0..source.len());
