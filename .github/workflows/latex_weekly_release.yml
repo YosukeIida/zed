@@ -47,53 +47,69 @@ jobs:
             exit 0
           fi
 
-          if git merge --no-commit --no-ff upstream/main; then
-            clean=true
-          else
-            clean=false
-          fi
+          git merge --no-commit --no-ff upstream/main || true
 
           conflicted=$(git diff --name-only --diff-filter=U || true)
+          extra_conflicts=$(comm -23 <(echo "$conflicted" | sed '/^$/d' | sort) <(printf 'Cargo.lock\ncrates/zed/Cargo.toml\n' | sort))
 
-          if [ "$clean" = false ]; then
-            extra_conflicts=$(comm -23 <(echo "$conflicted" | sort) <(printf 'Cargo.lock\ncrates/zed/Cargo.toml\n' | sort))
-            if [ -n "$extra_conflicts" ]; then
-              echo "Unresolvable conflicts outside the known version files:"
-              echo "$extra_conflicts"
-              git merge --abort
+          if [ -n "$extra_conflicts" ]; then
+            echo "Unresolvable conflicts outside the known version files:"
+            echo "$extra_conflicts"
+            git merge --abort
 
-              git push origin "upstream/main:refs/heads/sync/upstream-main" --force
+            git push origin "upstream/main:refs/heads/sync/upstream-main" --force
 
-              existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
-              if [ -z "$existing_pr" ]; then
-                gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
-                  --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
-                  --body "Automated weekly sync hit conflicts outside \`crates/zed/Cargo.toml\`/\`Cargo.lock\`. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
-              else
-                echo "PR #$existing_pr already open for this conflict; left as-is."
-              fi
-
-              echo "merged=false" >> "$GITHUB_OUTPUT"
-              exit 0
+            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
+            if [ -z "$existing_pr" ]; then
+              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
+                --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
+                --body "Automated weekly sync hit conflicts outside \`crates/zed/Cargo.toml\`/\`Cargo.lock\`. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
+            else
+              echo "PR #$existing_pr already open for this conflict; left as-is."
             fi
 
-            # Only the version files conflicted (expected every run, since our fork's
-            # version string always differs from upstream's). Resolve by taking
-            # upstream's manifest verbatim and overwriting just the version field.
-            git show upstream/main:crates/zed/Cargo.toml > /tmp/upstream-cargo-toml
-            upstream_version=$(grep -m1 '^version = ' /tmp/upstream-cargo-toml | sed -E 's/version = "(.*)"/\1/')
-            new_version="${upstream_version}-latex.1"
-            sed -E "0,/^version = \".*\"/s//version = \"${new_version}\"/" /tmp/upstream-cargo-toml > crates/zed/Cargo.toml
-            git add crates/zed/Cargo.toml
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
-            # Cargo.lock is fully derivable from the merged manifests; seed it with our
-            # side (so our fork-only dependencies stay present) and let `cargo metadata`
+          # At most crates/zed/Cargo.toml and Cargo.lock conflicted. We always
+          # recompute the version and rewrite it ourselves (rather than trusting
+          # whichever side git's 3-way merge happened to keep), since upstream not
+          # touching its own version string (no conflict at all) does not mean our
+          # fork's version shouldn't change - new upstream commits still landed and
+          # need a fresh, unique version/tag.
+          upstream_version=$(git show upstream/main:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
+          current_version=$(git show HEAD:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
+          current_base=${current_version%-latex.*}
+          current_counter=${current_version##*-latex.}
+
+          if [ "$upstream_version" != "$current_base" ]; then
+            new_version="${upstream_version}-latex.1"
+          else
+            new_version="${current_base}-latex.$((current_counter + 1))"
+          fi
+
+          git show upstream/main:crates/zed/Cargo.toml \
+            | sed -E "0,/^version = \".*\"/s//version = \"${new_version}\"/" \
+            > crates/zed/Cargo.toml
+          git add crates/zed/Cargo.toml
+
+          if echo "$conflicted" | grep -qx 'Cargo.lock'; then
+            # Cargo.lock is fully derivable from the manifests; seed it with our side
+            # (so our fork-only dependencies stay present) and let `cargo metadata`
             # reconcile it below.
             git checkout --ours -- Cargo.lock
             git add Cargo.lock
-          else
-            new_version=$(grep -m1 '^version = ' crates/zed/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
           fi
+
+          # Never let upstream's own CI changes ride in on this merge: GITHUB_TOKEN
+          # is not permitted to push commits that touch .github/workflows, and we
+          # don't want upstream's Zed-specific CI (self-hosted runners, secrets we
+          # don't have) in this fork anyway. Keep our own workflow files as-is.
+          git rm -r --cached --ignore-unmatch -- .github/workflows > /dev/null
+          rm -rf .github/workflows
+          git checkout HEAD -- .github/workflows
+          git add .github/workflows
 
           # Reconcile Cargo.lock against the merged Cargo.toml manifests (no compilation).
           cargo metadata --format-version 1 > /dev/null
