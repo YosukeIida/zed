@@ -43,8 +43,8 @@ use gpui::{
     ImageFormat, ImageSource, InspectorElementId, KeyContext, LayoutId, Length, LineFragment,
     MouseButton, MouseDownEvent, MouseEvent, MouseMoveEvent, MouseUpEvent, Point, ScrollHandle,
     ShapedLine, Size, Stateful, StrikethroughStyle, StyleRefinement, StyledImage, StyledText,
-    Subscription, Task, TextAlign, TextLayout, TextRun, TextStyle, TextStyleRefinement,
-    WrappedLineLayout, actions, canvas, img, point, quad,
+    Subscription, Task, TextAlign, TextLayout, TextRun, TextStyle, TextStyleRefinement, actions,
+    canvas, img, point, quad,
 };
 use language::{CharClassifier, Language, LanguageRegistry, Rope};
 use parser::CodeBlockMetadata;
