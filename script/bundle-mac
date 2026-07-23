@@ -84,13 +84,21 @@ fi
 # Generate the licenses first, so they can be baked into the binaries
 script/generate-licenses
 
-rustup target add $target_triple
+command -v rustup &> /dev/null && rustup target add $target_triple || true
+
+# Environments without the real Xcode Metal Toolchain (e.g. this fork's nix devshell)
+# can't compile shaders at build time; set ZED_LATEX_RUNTIME_SHADERS=1 to compile them
+# at runtime instead. CI runners ship a real Xcode, so this is left unset there.
+runtime_shaders_features=()
+if [[ "${ZED_LATEX_RUNTIME_SHADERS:-}" = "1" ]]; then
+    runtime_shaders_features=(--features gpui_platform/runtime_shaders)
+fi
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple
+cargo build ${build_flag} --package zed --package cli --target $target_triple "${runtime_shaders_features[@]}"
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
-cargo build ${build_flag} --package remote_server --target $target_triple
+cargo build ${build_flag} --package remote_server --target $target_triple "${runtime_shaders_features[@]}"
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -100,7 +108,7 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root | xargs)
+app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root "${runtime_shaders_features[@]}" | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd
@@ -192,8 +200,7 @@ function sign_app_binaries() {
     rm -rf "${app_path}/Contents/Frameworks"
     mkdir -p "${app_path}/Contents/Frameworks"
 
-    echo "Downloading git binary"
-    download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
+    echo "Skipping bundled git download (falls back to system git)"
 
     # Note: The app identifier for our development builds is the same as the app identifier for nightly.
     cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
@@ -265,8 +272,7 @@ function sign_app_binaries() {
         rm ${dmg_source_directory}/Applications
 
         echo "Adding license agreement to DMG"
-        npm install --global dmg-license minimist
-        dmg-license script/terms/terms.json "${dmg_file_path}"
+        npx --yes --package dmg-license --package minimist dmg-license script/terms/terms.json "${dmg_file_path}"
 
         if [[ $can_code_sign = true ]]; then
             echo "Notarizing DMG with Apple"
@@ -334,6 +340,17 @@ upload_debug_symbols
 
 cp target/${target_triple}/${target_dir}/zed "${app_path}/Contents/MacOS/zed"
 cp target/${target_triple}/${target_dir}/cli "${app_path}/Contents/MacOS/cli"
+
+echo "Rebranding app bundle"
+rebrand_dir=$(dirname "${app_path}")
+rebrand_path="${rebrand_dir}/Zed Dev RaTeX(unofficial).app"
+rm -rf "${rebrand_path}"
+mv "${app_path}" "${rebrand_path}"
+app_path="${rebrand_path}"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier dev.ratex.zed-dev" "${app_path}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleName Zed Dev RaTeX(unofficial)" "${app_path}/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Zed Dev RaTeX(unofficial)" "${app_path}/Contents/Info.plist"
+
 sign_app_binaries
 
 sign_binary "target/$target_triple/release/remote_server"
