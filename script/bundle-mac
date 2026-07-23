@@ -95,10 +95,10 @@ if [[ "${ZED_LATEX_RUNTIME_SHADERS:-}" = "1" ]]; then
 fi
 
 echo "Compiling zed binaries"
-cargo build ${build_flag} --package zed --package cli --target $target_triple "${runtime_shaders_features[@]}"
+cargo build ${build_flag} --package zed --package cli --target $target_triple ${runtime_shaders_features[@]+"${runtime_shaders_features[@]}"}
 # Build remote_server in separate invocation to prevent feature unification from other crates
 # from influencing dynamic libraries required by it.
-cargo build ${build_flag} --package remote_server --target $target_triple "${runtime_shaders_features[@]}"
+cargo build ${build_flag} --package remote_server --target $target_triple ${runtime_shaders_features[@]+"${runtime_shaders_features[@]}"}
 
 echo "Creating application bundle"
 pushd crates/zed
@@ -108,7 +108,7 @@ sed \
     "s/package.metadata.bundle-${channel}/package.metadata.bundle/" \
     Cargo.toml
 
-app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root "${runtime_shaders_features[@]}" | xargs)
+app_path=$(cargo bundle ${build_flag} --target $target_triple --select-workspace-root ${runtime_shaders_features[@]+"${runtime_shaders_features[@]}"} | xargs)
 
 mv Cargo.toml.backup Cargo.toml
 popd
