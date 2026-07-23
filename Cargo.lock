@@ -23303,7 +23303,7 @@ dependencies = [
 
 [[package]]
 name = "zed"
-version = "1.14.0-latex.1"
+version = "1.14.0-latex.3"
 dependencies = [
  "acp_thread",
  "acp_tools",
