@@ -1,0 +1,147 @@
+name: LaTeX weekly sync & release
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # every Monday 00:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: latex-weekly-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      version: ${{ steps.merge.outputs.version }}
+    steps:
+      - name: Checkout math-preview
+        uses: actions/checkout@v4
+        with:
+          ref: math-preview
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: git fetch https://github.com/zed-industries/zed.git main:refs/remotes/upstream/main
+
+      - name: Attempt merge and resolve version conflicts
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "upstream/main has no new commits since the last sync; nothing to do."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge --no-commit --no-ff upstream/main; then
+            clean=true
+          else
+            clean=false
+          fi
+
+          conflicted=$(git diff --name-only --diff-filter=U || true)
+
+          if [ "$clean" = false ]; then
+            extra_conflicts=$(comm -23 <(echo "$conflicted" | sort) <(printf 'Cargo.lock\ncrates/zed/Cargo.toml\n' | sort))
+            if [ -n "$extra_conflicts" ]; then
+              echo "Unresolvable conflicts outside the known version files:"
+              echo "$extra_conflicts"
+              git merge --abort
+
+              git push origin "upstream/main:refs/heads/sync/upstream-main" --force
+
+              existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
+              if [ -z "$existing_pr" ]; then
+                gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
+                  --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
+                  --body "Automated weekly sync hit conflicts outside \`crates/zed/Cargo.toml\`/\`Cargo.lock\`. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
+              else
+                echo "PR #$existing_pr already open for this conflict; left as-is."
+              fi
+
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            # Only the version files conflicted (expected every run, since our fork's
+            # version string always differs from upstream's). Resolve by taking
+            # upstream's manifest verbatim and overwriting just the version field.
+            git show upstream/main:crates/zed/Cargo.toml > /tmp/upstream-cargo-toml
+            upstream_version=$(grep -m1 '^version = ' /tmp/upstream-cargo-toml | sed -E 's/version = "(.*)"/\1/')
+            new_version="${upstream_version}-latex.1"
+            sed -E "0,/^version = \".*\"/s//version = \"${new_version}\"/" /tmp/upstream-cargo-toml > crates/zed/Cargo.toml
+            git add crates/zed/Cargo.toml
+
+            # Cargo.lock is fully derivable from the merged manifests; seed it with our
+            # side (so our fork-only dependencies stay present) and let `cargo metadata`
+            # reconcile it below.
+            git checkout --ours -- Cargo.lock
+            git add Cargo.lock
+          else
+            new_version=$(grep -m1 '^version = ' crates/zed/Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          fi
+
+          # Reconcile Cargo.lock against the merged Cargo.toml manifests (no compilation).
+          cargo metadata --format-version 1 > /dev/null
+          git add Cargo.lock
+
+          git commit -m "Merge upstream/main into math-preview, bump fork version to ${new_version}"
+          git push origin math-preview
+
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "version=${new_version}" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.merged == 'true'
+    runs-on: macos-14
+    steps:
+      - name: Checkout math-preview
+        uses: actions/checkout@v4
+        with:
+          ref: math-preview
+
+      - name: Build and bundle
+        run: script/bundle-mac aarch64-apple-darwin
+
+      - name: Rename dmg for release
+        id: dmg
+        run: |
+          version="${{ needs.sync-upstream.outputs.version }}"
+          src="target/aarch64-apple-darwin/release/Zed-aarch64.dmg"
+          dst="target/aarch64-apple-darwin/release/Zed-Dev-RaTeX-unofficial-${version}-aarch64.dmg"
+          cp "$src" "$dst"
+          echo "path=${dst}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.sync-upstream.outputs.version }}"
+          cat > /tmp/release-notes.md <<EOF
+          Zed Dev RaTeX (unofficial) automated weekly build, synced from upstream zed-industries/zed main branch (LaTeX math preview support via the RaTeX rendering pipeline).
+
+          - Bundle identifier: \`dev.ratex.zed-dev\`
+          - Signed ad-hoc (no Apple Developer certificate)
+          - git is **not bundled** in this build; the app falls back to the system \`git\` on your PATH
+          EOF
+          gh release create "v${version}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target math-preview \
+            --title "Zed Dev RaTeX (unofficial) ${version}" \
+            --notes-file /tmp/release-notes.md \
+            "${{ steps.dmg.outputs.path }}"
