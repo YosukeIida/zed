@@ -9733,6 +9733,7 @@ dependencies = [
  "fuzzy_nucleo",
  "globset",
  "gpui",
+ "grammars",
  "http_client",
  "imara-diff",
  "indoc",
@@ -23303,7 +23304,7 @@ dependencies = [
 
 [[package]]
 name = "zed"
-version = "1.14.0-latex.3"
+version = "1.14.0-latex.4"
 dependencies = [
  "acp_thread",
  "acp_tools",
