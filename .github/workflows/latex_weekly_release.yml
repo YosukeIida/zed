@@ -125,6 +125,10 @@ jobs:
     needs: sync-upstream
     if: needs.sync-upstream.outputs.merged == 'true'
     runs-on: macos-26
+    env:
+      # Surfaced at job level so the cask-bump steps can guard on it: the secrets
+      # context is not available to a step's `if:`, but the env context is.
+      TAP_BUMP_APP_ID: ${{ secrets.TAP_BUMP_APP_ID }}
     steps:
       - name: Checkout math-preview
         uses: actions/checkout@v4
@@ -162,29 +166,39 @@ jobs:
             --notes-file /tmp/release-notes.md \
             "${{ steps.dmg.outputs.path }}"
 
+      # github.token cannot reach another repository, so mint a short-lived
+      # installation token for the tap instead of storing a long-lived PAT. The
+      # App's private key does not expire, so there is nothing to rotate, and the
+      # action revokes the token when the job ends.
+      - name: Mint a token for the Homebrew tap
+        id: tap-token
+        if: env.TAP_BUMP_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.TAP_BUMP_APP_ID }}
+          private-key: ${{ secrets.TAP_BUMP_APP_PRIVATE_KEY }}
+          owner: YosukeIida
+          repositories: homebrew-casks-personal
+          # Narrow the token further than the installation itself, so it can only
+          # do the one thing this step needs.
+          permission-contents: write
+
       # Keep the Homebrew cask in step with the release we just published, so
       # `brew upgrade --cask` picks it up without a manual bump every Monday.
-      # Needs a token with contents:write on the tap repo; github.token is
-      # scoped to this repository only.
       - name: Bump the zed-dev-ratex cask in the Homebrew tap
+        if: env.TAP_BUMP_APP_ID != ''
         env:
-          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+          TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+          APP_SLUG: ${{ steps.tap-token.outputs.app-slug }}
         run: |
           set -euo pipefail
-
-          # Guarded here rather than in `if:` because the secrets context is not
-          # available to a step-level condition.
-          if [ -z "${TAP_PUSH_TOKEN:-}" ]; then
-            echo "TAP_PUSH_TOKEN is not configured; skipping the cask bump." >&2
-            exit 0
-          fi
 
           version="${{ needs.sync-upstream.outputs.version }}"
           sha="$(shasum -a 256 "${{ steps.dmg.outputs.path }}" | cut -d' ' -f1)"
           cask_path="Casks/zed-dev-ratex.rb"
 
           git clone --depth 1 \
-            "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/YosukeIida/homebrew-casks-personal.git" tap
+            "https://x-access-token:${TAP_TOKEN}@github.com/YosukeIida/homebrew-casks-personal.git" tap
           cd tap
 
           # Rewrite only the two pinned fields; leave url/livecheck/app alone.
@@ -205,7 +219,7 @@ jobs:
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
           git commit -q -m "feat: update zed-dev-ratex to ${version}" -- "$cask_path"
           git push origin HEAD:main
