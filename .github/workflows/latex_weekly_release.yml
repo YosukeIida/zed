@@ -47,6 +47,22 @@ jobs:
             exit 0
           fi
 
+          # Hand the sync over for manual resolution: abort, publish upstream/main
+          # as a branch, and open (or reuse) a PR describing why. $1 is the reason
+          # shown in the PR body.
+          hand_off_for_manual_sync() {
+            git push origin "upstream/main:refs/heads/sync/upstream-main" --force
+
+            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
+            if [ -z "$existing_pr" ]; then
+              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
+                --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
+                --body "Automated weekly sync stopped: $1. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
+            else
+              echo "PR #$existing_pr already open for this sync; left as-is."
+            fi
+          }
+
           git merge --no-commit --no-ff upstream/main || true
 
           conflicted=$(git diff --name-only --diff-filter=U || true)
@@ -57,16 +73,29 @@ jobs:
             echo "$extra_conflicts"
             git merge --abort
 
-            git push origin "upstream/main:refs/heads/sync/upstream-main" --force
+            hand_off_for_manual_sync "it hit conflicts outside \`crates/zed/Cargo.toml\`/\`Cargo.lock\`"
 
-            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
-            if [ -z "$existing_pr" ]; then
-              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
-                --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
-                --body "Automated weekly sync hit conflicts outside \`crates/zed/Cargo.toml\`/\`Cargo.lock\`. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
-            else
-              echo "PR #$existing_pr already open for this conflict; left as-is."
-            fi
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The rewrite further down replaces crates/zed/Cargo.toml with upstream's
+          # copy and restores only the version line, so any other fork-side edit to
+          # that file would be silently reverted. The fork currently keeps all of its
+          # own work in crates/markdown/ and the root Cargo.toml, so that holds - but
+          # verify it rather than trusting it.
+          merge_base=$(git merge-base upstream/main HEAD)
+          without_version() { grep -v '^version = ' || true; }
+          if ! diff -q \
+              <(git show "$merge_base":crates/zed/Cargo.toml | without_version) \
+              <(git show HEAD:crates/zed/Cargo.toml | without_version) >/dev/null; then
+            echo "crates/zed/Cargo.toml has fork-side changes beyond the version line."
+            echo "Rewriting it from upstream would discard these:"
+            diff <(git show "$merge_base":crates/zed/Cargo.toml | without_version) \
+                 <(git show HEAD:crates/zed/Cargo.toml | without_version) || true
+            git merge --abort
+
+            hand_off_for_manual_sync "\`crates/zed/Cargo.toml\` carries fork-side changes beyond the version line, which this workflow's version rewrite would discard"
 
             echo "merged=false" >> "$GITHUB_OUTPUT"
             exit 0
