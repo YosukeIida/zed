@@ -161,3 +161,51 @@ jobs:
             --title "Zed Dev RaTeX (unofficial) ${version}" \
             --notes-file /tmp/release-notes.md \
             "${{ steps.dmg.outputs.path }}"
+
+      # Keep the Homebrew cask in step with the release we just published, so
+      # `brew upgrade --cask` picks it up without a manual bump every Monday.
+      # Needs a token with contents:write on the tap repo; github.token is
+      # scoped to this repository only.
+      - name: Bump the zed-dev-ratex cask in the Homebrew tap
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Guarded here rather than in `if:` because the secrets context is not
+          # available to a step-level condition.
+          if [ -z "${TAP_PUSH_TOKEN:-}" ]; then
+            echo "TAP_PUSH_TOKEN is not configured; skipping the cask bump." >&2
+            exit 0
+          fi
+
+          version="${{ needs.sync-upstream.outputs.version }}"
+          sha="$(shasum -a 256 "${{ steps.dmg.outputs.path }}" | cut -d' ' -f1)"
+          cask_path="Casks/zed-dev-ratex.rb"
+
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/YosukeIida/homebrew-casks-personal.git" tap
+          cd tap
+
+          # Rewrite only the two pinned fields; leave url/livecheck/app alone.
+          # Fail loudly if either anchor is missing rather than pushing a cask
+          # that still points at the previous build.
+          grep -q '^  version "' "$cask_path"
+          grep -q '^  sha256 "' "$cask_path"
+          # Plain substitutions, not `0,/re/` ranges: this job runs on macOS, and
+          # BSD sed silently ignores that GNU-only address form (the sync-upstream
+          # job above can use it because it runs on ubuntu).
+          sed -i '' -E \
+            -e "s|^  version \".*\"|  version \"${version}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" \
+            "$cask_path"
+
+          if git diff --quiet -- "$cask_path"; then
+            echo "cask already at ${version}; nothing to push."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "feat: update zed-dev-ratex to ${version}" -- "$cask_path"
+          git push origin HEAD:main
