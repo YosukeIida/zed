@@ -78,16 +78,33 @@ jobs:
           # touching its own version string (no conflict at all) does not mean our
           # fork's version shouldn't change - new upstream commits still landed and
           # need a fresh, unique version/tag.
+          #
+          # Version scheme: <upstream version>-latex.<generation>
+          #
+          # The generation counts *our* RaTeX work, not releases, so a sync that
+          # only brings in upstream commits must leave it untouched - bump it by
+          # hand in crates/zed/Cargo.toml when the LaTeX side actually changes.
           upstream_version=$(git show upstream/main:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
           current_version=$(git show HEAD:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
-          current_base=${current_version%-latex.*}
-          current_counter=${current_version##*-latex.}
 
-          if [ "$upstream_version" != "$current_base" ]; then
-            new_version="${upstream_version}-latex.1"
-          else
-            new_version="${current_base}-latex.$((current_counter + 1))"
+          # Read the generation back out, ignoring any build segment a previous
+          # collision appended, so it never compounds into -latex.5.1.1.
+          gen=$(printf '%s\n' "$current_version" | sed -nE 's/^[0-9.]+-latex\.([0-9]+).*$/\1/p')
+          if [ -z "$gen" ]; then
+            echo "cannot read the -latex.<generation> out of '$current_version'" >&2
+            exit 1
           fi
+
+          new_version="${upstream_version}-latex.${gen}"
+
+          # Upstream bumps its own version most weeks, so the base alone normally
+          # makes the tag unique. On the weeks it doesn't, add a build segment
+          # rather than touching the generation.
+          build=0
+          while git ls-remote --exit-code --tags origin "refs/tags/v${new_version}" >/dev/null 2>&1; do
+            build=$((build + 1))
+            new_version="${upstream_version}-latex.${gen}.${build}"
+          done
 
           git show upstream/main:crates/zed/Cargo.toml \
             | sed -E "0,/^version = \".*\"/s//version = \"${new_version}\"/" \
