@@ -59,16 +59,37 @@ jobs:
             exit 0
           fi
 
-          # Hand the sync over for manual resolution by opening a cross-fork PR
-          # straight from upstream's branch - no push of our own is involved, so
-          # this can never be rejected for touching .github/workflows (GITHUB_TOKEN
-          # has no `workflows` permission and never will: pushing upstream/main's
-          # own copy of those files, even to a throwaway branch, is rejected
-          # outright). $1 is the reason shown in the PR body.
+          # Hand the sync over for manual resolution: publish upstream/main under
+          # our own repo as a branch, and open (or reuse) a PR describing why.
+          # $1 is the reason shown in the PR body.
+          #
+          # A cross-fork PR (head: zed-industries:main) was tried first to avoid
+          # ever pushing anything ourselves, but GitHub rejects it with "Fork
+          # collab can't be granted by someone without permission" - creating a
+          # PR whose head is the parent repo's branch requires a fork-network
+          # collaboration grant that GITHUB_TOKEN cannot make. So we're back to
+          # pushing our own branch - but pushing upstream/main's tree as-is fails
+          # too: GITHUB_TOKEN has no `workflows` permission, and GitHub rejects
+          # outright any push whose tree touches .github/workflows. Work around
+          # both restrictions in one step: build the hand-off branch as upstream/
+          # main plus one extra commit that restores .github/workflows to our own
+          # copy, so the pushed tree never touches those files. Whoever resolves
+          # the PR by hand still sees every real upstream commit; only the
+          # workflow-file "conflict" is pre-resolved, exactly as the happy path
+          # below always resolves it (keep our own CI, never upstream's).
           hand_off_for_manual_sync() {
-            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head zed-industries:main --json number -q '.[0].number // empty' || true)
+            git switch --detach upstream/main
+            git rm -r --cached --ignore-unmatch -- .github/workflows > /dev/null
+            rm -rf .github/workflows
+            git checkout math-preview -- .github/workflows
+            git add .github/workflows
+            git commit -m "Restore fork's .github/workflows on top of upstream/main for hand-off"
+            git push origin "HEAD:refs/heads/sync/upstream-main" --force
+            git switch math-preview
+
+            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
             if [ -z "$existing_pr" ]; then
-              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head zed-industries:main \
+              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
                 --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
                 --body "Automated weekly sync stopped: $1. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
             else
