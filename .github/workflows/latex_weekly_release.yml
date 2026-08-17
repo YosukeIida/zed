@@ -42,20 +42,33 @@ jobs:
           set -euo pipefail
 
           if git merge-base --is-ancestor upstream/main HEAD; then
-            echo "upstream/main has no new commits since the last sync; nothing to do."
-            echo "merged=false" >> "$GITHUB_OUTPUT"
+            # Already caught up with upstream - but that alone doesn't mean this
+            # version shipped a release yet (e.g. a manual/local merge landed the
+            # commit without going through build-and-release). Check the tag
+            # rather than assuming merged-in-CI is the only way HEAD gets ahead.
+            current_version=$(git show HEAD:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
+            if git ls-remote --exit-code --tags origin "refs/tags/v${current_version}" >/dev/null 2>&1; then
+              echo "upstream/main has no new commits since the last sync, and v${current_version} is already released; nothing to do."
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "upstream/main has no new commits since the last sync, but v${current_version} hasn't been released yet; building it now."
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            echo "version=${current_version}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # Hand the sync over for manual resolution: abort, publish upstream/main
-          # as a branch, and open (or reuse) a PR describing why. $1 is the reason
-          # shown in the PR body.
+          # Hand the sync over for manual resolution by opening a cross-fork PR
+          # straight from upstream's branch - no push of our own is involved, so
+          # this can never be rejected for touching .github/workflows (GITHUB_TOKEN
+          # has no `workflows` permission and never will: pushing upstream/main's
+          # own copy of those files, even to a throwaway branch, is rejected
+          # outright). $1 is the reason shown in the PR body.
           hand_off_for_manual_sync() {
-            git push origin "upstream/main:refs/heads/sync/upstream-main" --force
-
-            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
+            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head zed-industries:main --json number -q '.[0].number // empty' || true)
             if [ -z "$existing_pr" ]; then
-              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
+              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head zed-industries:main \
                 --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
                 --body "Automated weekly sync stopped: $1. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
             else
