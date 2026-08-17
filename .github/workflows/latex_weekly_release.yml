@@ -41,21 +41,24 @@ jobs:
         run: |
           set -euo pipefail
 
-          if git merge-base --is-ancestor upstream/main HEAD; then
-            # Already caught up with upstream - but that alone doesn't mean this
-            # version shipped a release yet (e.g. a manual/local merge landed the
-            # commit without going through build-and-release). Check the tag
-            # rather than assuming merged-in-CI is the only way HEAD gets ahead.
-            current_version=$(git show HEAD:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
-            if git ls-remote --exit-code --tags origin "refs/tags/v${current_version}" >/dev/null 2>&1; then
-              echo "upstream/main has no new commits since the last sync, and v${current_version} is already released; nothing to do."
-              echo "merged=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-
-            echo "upstream/main has no new commits since the last sync, but v${current_version} hasn't been released yet; building it now."
+          # Check first whether HEAD's own version has shipped a release yet -
+          # independent of whether upstream has moved further since. Otherwise, on
+          # a week where upstream keeps landing new commits (and thus conflicts)
+          # faster than a human resolves the hand-off PR, HEAD could sit merged
+          # but never built: `merge-base --is-ancestor upstream/main HEAD` would
+          # stay false forever, so a version that's ready to build would keep
+          # losing to a fresh merge attempt that immediately hands off again.
+          current_version=$(git show HEAD:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
+          if ! git ls-remote --exit-code --tags origin "refs/tags/v${current_version}" >/dev/null 2>&1; then
+            echo "HEAD (v${current_version}) hasn't been released yet; building it now instead of attempting a new merge."
             echo "merged=true" >> "$GITHUB_OUTPUT"
             echo "version=${current_version}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "upstream/main has no new commits since the last sync, and v${current_version} is already released; nothing to do."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
