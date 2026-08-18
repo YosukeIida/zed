@@ -1,0 +1,308 @@
+name: LaTeX weekly sync & release
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # every Monday 00:00 UTC
+  workflow_dispatch: {}
+
+concurrency:
+  group: latex-weekly-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      merged: ${{ steps.merge.outputs.merged }}
+      version: ${{ steps.merge.outputs.version }}
+    steps:
+      - name: Checkout math-preview
+        uses: actions/checkout@v4
+        with:
+          ref: math-preview
+          fetch-depth: 0
+
+      - name: Configure git identity
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: git fetch https://github.com/zed-industries/zed.git main:refs/remotes/upstream/main
+
+      - name: Attempt merge and resolve version conflicts
+        id: merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          # Check first whether HEAD's own version has shipped a release yet -
+          # independent of whether upstream has moved further since. Otherwise, on
+          # a week where upstream keeps landing new commits (and thus conflicts)
+          # faster than a human resolves the hand-off PR, HEAD could sit merged
+          # but never built: `merge-base --is-ancestor upstream/main HEAD` would
+          # stay false forever, so a version that's ready to build would keep
+          # losing to a fresh merge attempt that immediately hands off again.
+          current_version=$(git show HEAD:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
+          if ! git ls-remote --exit-code --tags origin "refs/tags/v${current_version}" >/dev/null 2>&1; then
+            echo "HEAD (v${current_version}) hasn't been released yet; building it now instead of attempting a new merge."
+            echo "merged=true" >> "$GITHUB_OUTPUT"
+            echo "version=${current_version}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "upstream/main has no new commits since the last sync, and v${current_version} is already released; nothing to do."
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Hand the sync over for manual resolution: publish upstream/main under
+          # our own repo as a branch, and open (or reuse) a PR describing why.
+          # $1 is the reason shown in the PR body.
+          #
+          # A cross-fork PR (head: zed-industries:main) was tried first to avoid
+          # ever pushing anything ourselves, but GitHub rejects it with "Fork
+          # collab can't be granted by someone without permission" - creating a
+          # PR whose head is the parent repo's branch requires a fork-network
+          # collaboration grant that GITHUB_TOKEN cannot make. So we're back to
+          # pushing our own branch - but pushing upstream/main's tree as-is fails
+          # too: GITHUB_TOKEN has no `workflows` permission, and GitHub rejects
+          # outright any push whose tree touches .github/workflows. Work around
+          # both restrictions in one step: build the hand-off branch as upstream/
+          # main plus one extra commit that restores .github/workflows to our own
+          # copy, so the pushed tree never touches those files. Whoever resolves
+          # the PR by hand still sees every real upstream commit; only the
+          # workflow-file "conflict" is pre-resolved, exactly as the happy path
+          # below always resolves it (keep our own CI, never upstream's).
+          hand_off_for_manual_sync() {
+            git switch --detach upstream/main
+            git rm -r --cached --ignore-unmatch -- .github/workflows > /dev/null
+            rm -rf .github/workflows
+            git checkout math-preview -- .github/workflows
+            git add .github/workflows
+            git commit -m "Restore fork's .github/workflows on top of upstream/main for hand-off"
+            git push origin "HEAD:refs/heads/sync/upstream-main" --force
+            git switch math-preview
+
+            existing_pr=$(gh pr list --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main --json number -q '.[0].number // empty' || true)
+            if [ -z "$existing_pr" ]; then
+              gh pr create --repo "$GITHUB_REPOSITORY" --base math-preview --head sync/upstream-main \
+                --title "Sync upstream/main into math-preview ($(date -u +%Y-%m-%d))" \
+                --body "Automated weekly sync stopped: $1. Please resolve manually, merge this PR, then re-run the *LaTeX weekly sync & release* workflow to build and publish a release from the result."
+            else
+              echo "PR #$existing_pr already open for this sync; left as-is."
+            fi
+          }
+
+          git merge --no-commit --no-ff upstream/main || true
+
+          conflicted=$(git diff --name-only --diff-filter=U || true)
+          extra_conflicts=$(comm -23 <(echo "$conflicted" | sed '/^$/d' | sort) <(printf 'Cargo.lock\ncrates/zed/Cargo.toml\n' | sort))
+
+          if [ -n "$extra_conflicts" ]; then
+            echo "Unresolvable conflicts outside the known version files:"
+            echo "$extra_conflicts"
+            git merge --abort
+
+            hand_off_for_manual_sync "it hit conflicts outside \`crates/zed/Cargo.toml\`/\`Cargo.lock\`"
+
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The rewrite further down replaces crates/zed/Cargo.toml with upstream's
+          # copy and restores only the version line, so any other fork-side edit to
+          # that file would be silently reverted. The fork currently keeps all of its
+          # own work in crates/markdown/ and the root Cargo.toml, so that holds - but
+          # verify it rather than trusting it.
+          merge_base=$(git merge-base upstream/main HEAD)
+          without_version() { grep -v '^version = ' || true; }
+          if ! diff -q \
+              <(git show "$merge_base":crates/zed/Cargo.toml | without_version) \
+              <(git show HEAD:crates/zed/Cargo.toml | without_version) >/dev/null; then
+            echo "crates/zed/Cargo.toml has fork-side changes beyond the version line."
+            echo "Rewriting it from upstream would discard these:"
+            diff <(git show "$merge_base":crates/zed/Cargo.toml | without_version) \
+                 <(git show HEAD:crates/zed/Cargo.toml | without_version) || true
+            git merge --abort
+
+            hand_off_for_manual_sync "\`crates/zed/Cargo.toml\` carries fork-side changes beyond the version line, which this workflow's version rewrite would discard"
+
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # At most crates/zed/Cargo.toml and Cargo.lock conflicted. We always
+          # recompute the version and rewrite it ourselves (rather than trusting
+          # whichever side git's 3-way merge happened to keep), since upstream not
+          # touching its own version string (no conflict at all) does not mean our
+          # fork's version shouldn't change - new upstream commits still landed and
+          # need a fresh, unique version/tag.
+          #
+          # Version scheme: <upstream version>-latex.<generation>
+          #
+          # The generation counts *our* RaTeX work, not releases, so a sync that
+          # only brings in upstream commits must leave it untouched - bump it by
+          # hand in crates/zed/Cargo.toml when the LaTeX side actually changes.
+          upstream_version=$(git show upstream/main:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
+          current_version=$(git show HEAD:crates/zed/Cargo.toml | grep -m1 '^version = ' | sed -E 's/version = "(.*)"/\1/')
+
+          # Read the generation back out, ignoring any build segment a previous
+          # collision appended, so it never compounds into -latex.5.1.1.
+          gen=$(printf '%s\n' "$current_version" | sed -nE 's/^[0-9.]+-latex\.([0-9]+).*$/\1/p')
+          if [ -z "$gen" ]; then
+            echo "cannot read the -latex.<generation> out of '$current_version'" >&2
+            exit 1
+          fi
+
+          new_version="${upstream_version}-latex.${gen}"
+
+          # Upstream bumps its own version most weeks, so the base alone normally
+          # makes the tag unique. On the weeks it doesn't, add a build segment
+          # rather than touching the generation.
+          build=0
+          while git ls-remote --exit-code --tags origin "refs/tags/v${new_version}" >/dev/null 2>&1; do
+            build=$((build + 1))
+            new_version="${upstream_version}-latex.${gen}.${build}"
+          done
+
+          git show upstream/main:crates/zed/Cargo.toml \
+            | sed -E "0,/^version = \".*\"/s//version = \"${new_version}\"/" \
+            > crates/zed/Cargo.toml
+          git add crates/zed/Cargo.toml
+
+          if echo "$conflicted" | grep -qx 'Cargo.lock'; then
+            # Cargo.lock is fully derivable from the manifests; seed it with our side
+            # (so our fork-only dependencies stay present) and let `cargo metadata`
+            # reconcile it below.
+            git checkout --ours -- Cargo.lock
+            git add Cargo.lock
+          fi
+
+          # Never let upstream's own CI changes ride in on this merge: GITHUB_TOKEN
+          # is not permitted to push commits that touch .github/workflows, and we
+          # don't want upstream's Zed-specific CI (self-hosted runners, secrets we
+          # don't have) in this fork anyway. Keep our own workflow files as-is.
+          git rm -r --cached --ignore-unmatch -- .github/workflows > /dev/null
+          rm -rf .github/workflows
+          git checkout HEAD -- .github/workflows
+          git add .github/workflows
+
+          # Reconcile Cargo.lock against the merged Cargo.toml manifests (no compilation).
+          cargo metadata --format-version 1 > /dev/null
+          git add Cargo.lock
+
+          git commit -m "Merge upstream/main into math-preview, bump fork version to ${new_version}"
+          git push origin math-preview
+
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "version=${new_version}" >> "$GITHUB_OUTPUT"
+
+  build-and-release:
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.merged == 'true'
+    runs-on: macos-26
+    env:
+      # Surfaced at job level so the cask-bump steps can guard on it: the secrets
+      # context is not available to a step's `if:`, but the env context is.
+      TAP_BUMP_APP_ID: ${{ secrets.TAP_BUMP_APP_ID }}
+    steps:
+      - name: Checkout math-preview
+        uses: actions/checkout@v4
+        with:
+          ref: math-preview
+
+      - name: Build and bundle
+        run: script/bundle-mac aarch64-apple-darwin
+
+      - name: Rename dmg for release
+        id: dmg
+        run: |
+          version="${{ needs.sync-upstream.outputs.version }}"
+          src="target/aarch64-apple-darwin/release/Zed-aarch64.dmg"
+          dst="target/aarch64-apple-darwin/release/Zed-Dev-RaTeX-unofficial-${version}-aarch64.dmg"
+          cp "$src" "$dst"
+          echo "path=${dst}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.sync-upstream.outputs.version }}"
+          cat > /tmp/release-notes.md <<EOF
+          Zed Dev RaTeX (unofficial) automated weekly build, synced from upstream zed-industries/zed main branch (LaTeX math preview support via the RaTeX rendering pipeline).
+
+          - Bundle identifier: \`dev.ratex.zed-dev\`
+          - Signed ad-hoc (no Apple Developer certificate)
+          - git is **not bundled** in this build; the app falls back to the system \`git\` on your PATH
+          EOF
+          gh release create "v${version}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target math-preview \
+            --title "Zed Dev RaTeX (unofficial) ${version}" \
+            --notes-file /tmp/release-notes.md \
+            "${{ steps.dmg.outputs.path }}"
+
+      # github.token cannot reach another repository, so mint a short-lived
+      # installation token for the tap instead of storing a long-lived PAT. The
+      # App's private key does not expire, so there is nothing to rotate, and the
+      # action revokes the token when the job ends.
+      - name: Mint a token for the Homebrew tap
+        id: tap-token
+        if: env.TAP_BUMP_APP_ID != ''
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.TAP_BUMP_APP_ID }}
+          private-key: ${{ secrets.TAP_BUMP_APP_PRIVATE_KEY }}
+          owner: YosukeIida
+          repositories: homebrew-casks-personal
+          # Narrow the token further than the installation itself, so it can only
+          # do the one thing this step needs.
+          permission-contents: write
+
+      # Keep the Homebrew cask in step with the release we just published, so
+      # `brew upgrade --cask` picks it up without a manual bump every Monday.
+      - name: Bump the zed-dev-ratex cask in the Homebrew tap
+        if: env.TAP_BUMP_APP_ID != ''
+        env:
+          TAP_TOKEN: ${{ steps.tap-token.outputs.token }}
+          APP_SLUG: ${{ steps.tap-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+
+          version="${{ needs.sync-upstream.outputs.version }}"
+          sha="$(shasum -a 256 "${{ steps.dmg.outputs.path }}" | cut -d' ' -f1)"
+          cask_path="Casks/zed-dev-ratex.rb"
+
+          git clone --depth 1 \
+            "https://x-access-token:${TAP_TOKEN}@github.com/YosukeIida/homebrew-casks-personal.git" tap
+          cd tap
+
+          # Rewrite only the two pinned fields; leave url/livecheck/app alone.
+          # Fail loudly if either anchor is missing rather than pushing a cask
+          # that still points at the previous build.
+          grep -q '^  version "' "$cask_path"
+          grep -q '^  sha256 "' "$cask_path"
+          # Plain substitutions, not `0,/re/` ranges: this job runs on macOS, and
+          # BSD sed silently ignores that GNU-only address form (the sync-upstream
+          # job above can use it because it runs on ubuntu).
+          sed -i '' -E \
+            -e "s|^  version \".*\"|  version \"${version}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" \
+            "$cask_path"
+
+          if git diff --quiet -- "$cask_path"; then
+            echo "cask already at ${version}; nothing to push."
+            exit 0
+          fi
+
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git commit -q -m "feat: update zed-dev-ratex to ${version}" -- "$cask_path"
+          git push origin HEAD:main
