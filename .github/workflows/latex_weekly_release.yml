@@ -241,13 +241,30 @@ jobs:
           - Bundle identifier: \`dev.ratex.zed-dev\`
           - Signed ad-hoc (no Apple Developer certificate)
           - git is **not bundled** in this build; the app falls back to the system \`git\` on your PATH
+
+          ## SSH remote development
+
+          This is a \`dev\`-channel build, so the app's own SSH remote-connection
+          flow (\`Failed to connect over SSH\`) cannot auto-download a matching
+          remote server the way official Zed releases do. \`zed-remote-server-macos-aarch64.gz\`
+          in this release is the same version's remote server, built alongside this app.
+          On the remote Mac (must be Apple Silicon):
+
+          \`\`\`sh
+          mkdir -p ~/.zed_server
+          curl -L -o ~/.zed_server/zed-remote-server-dev-build.gz \\
+            https://github.com/${{ github.repository }}/releases/download/v${version}/zed-remote-server-macos-aarch64.gz
+          gunzip -f ~/.zed_server/zed-remote-server-dev-build.gz
+          chmod +x ~/.zed_server/zed-remote-server-dev-build
+          \`\`\`
           EOF
           gh release create "v${version}" \
             --repo "$GITHUB_REPOSITORY" \
             --target math-preview \
             --title "Zed Dev RaTeX (unofficial) ${version}" \
             --notes-file /tmp/release-notes.md \
-            "${{ steps.dmg.outputs.path }}"
+            "${{ steps.dmg.outputs.path }}" \
+            "target/zed-remote-server-macos-aarch64.gz"
 
       # github.token cannot reach another repository, so mint a short-lived
       # installation token for the tap instead of storing a long-lived PAT. The
