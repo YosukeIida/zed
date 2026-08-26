@@ -1,0 +1,11 @@
+name: probe-release-perms
+on: workflow_dispatch
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create probe-perms --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe --notes probe
