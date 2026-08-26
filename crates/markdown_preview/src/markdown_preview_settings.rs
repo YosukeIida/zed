@@ -1,5 +1,5 @@
-use gpui::{Pixels, px};
-use settings::{RegisterSetting, Settings};
+use gpui::Pixels;
+use settings::{IntoGpui, RegisterSetting, Settings};
 
 /// The settings for the markdown preview.
 #[derive(Clone, Copy, Debug, Default, RegisterSetting)]
@@ -15,7 +15,7 @@ impl Settings for MarkdownPreviewSettings {
         // Fork default: render the preview edge to edge unless the user explicitly opts into
         // a limited content width (upstream defaults this to `true`).
         let max_width = if content.limit_content_width.unwrap_or(false) {
-            content.max_width.map(px)
+            content.max_width.map(IntoGpui::into_gpui)
         } else {
             None
         };
