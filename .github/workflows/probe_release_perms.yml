@@ -6,6 +6,14 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: ${{ secrets.TAP_BUMP_APP_ID }}
+          private-key: ${{ secrets.TAP_BUMP_APP_PRIVATE_KEY }}
+          owner: YosukeIida
+          repositories: zed
+          permission-contents: write
       - env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create probe-perms --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe --notes probe
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh release create probe-perms-2 --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe2 --notes probe2
