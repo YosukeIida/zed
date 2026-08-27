@@ -14,6 +14,23 @@ jobs:
           owner: YosukeIida
           repositories: zed
           permission-contents: write
-      - env:
+      - name: target=main, github.token
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create probe-perms-main-ghtoken --repo "$GITHUB_REPOSITORY" --target main --draft --title probe-main-ghtoken --notes x
+      - name: target=math-preview, github.token
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create probe-perms-mp-ghtoken --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-mp-ghtoken --notes x
+      - name: target=main, app-token
+        continue-on-error: true
+        env:
           GH_TOKEN: ${{ steps.app-token.outputs.token }}
-        run: gh release create probe-perms-2 --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe2 --notes probe2
+        run: gh release create probe-perms-main-apptoken --repo "$GITHUB_REPOSITORY" --target main --draft --title probe-main-apptoken --notes x
+      - name: target=math-preview, app-token
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: gh release create probe-perms-mp-apptoken --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-mp-apptoken --notes x
