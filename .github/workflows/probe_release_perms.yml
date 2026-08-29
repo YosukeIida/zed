@@ -9,7 +9,32 @@ jobs:
       ok: "true"
     steps:
       - run: echo ok
-  probe-ubuntu:
+
+  plain:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create probe-plain --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-plain --notes x
+
+  needs-only:
+    needs: setup
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create probe-needs-only --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-needs-only --notes x
+
+  secret-env-only:
+    runs-on: ubuntu-latest
+    env:
+      TAP_BUMP_APP_ID: ${{ secrets.TAP_BUMP_APP_ID }}
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create probe-secret-env-only --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-secret-env-only --notes x
+
+  both:
     needs: setup
     runs-on: ubuntu-latest
     env:
@@ -17,13 +42,4 @@ jobs:
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create probe-perms-ubuntu-needs --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-ubuntu-needs --notes x
-  probe-macos:
-    needs: setup
-    runs-on: macos-26
-    env:
-      TAP_BUMP_APP_ID: ${{ secrets.TAP_BUMP_APP_ID }}
-    steps:
-      - env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release create probe-perms-macos-needs --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-macos-needs --notes x
+        run: gh release create probe-both --repo "$GITHUB_REPOSITORY" --target math-preview --draft --title probe-both --notes x
