@@ -230,6 +230,29 @@ jobs:
           cp "$src" "$dst"
           echo "path=${dst}" >> "$GITHUB_OUTPUT"
 
+      # So a failure in a later step (release creation, tap bump) never costs another
+      # 2.5-hour rebuild - the dmg/gz can be pulled from here and released by hand.
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: zed-dev-ratex-${{ needs.sync-upstream.outputs.version }}
+          path: |
+            ${{ steps.dmg.outputs.path }}
+            target/zed-remote-server-macos-aarch64.gz
+          retention-days: 3
+
+      # `gh release create --target <branch>` has to create the tag server-side, which
+      # triggers a workflow-file scan on this large repo that can time out and surface as
+      # a misleading "HTTP 403: Resource not accessible by integration" (observed and
+      # reproduced 2026-08-26/27/29 - not a real permissions gap: releasing against an
+      # already-existing tag works every time). Push the tag ourselves first with plain
+      # git, so the release-create call below never has to create a ref.
+      - name: Push release tag
+        run: |
+          version="${{ needs.sync-upstream.outputs.version }}"
+          git tag "v${version}"
+          git push origin "v${version}"
+
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -258,13 +281,23 @@ jobs:
           chmod +x ~/.zed_server/zed-remote-server-dev-build
           \`\`\`
           EOF
-          gh release create "v${version}" \
-            --repo "$GITHUB_REPOSITORY" \
-            --target math-preview \
-            --title "Zed Dev RaTeX (unofficial) ${version}" \
-            --notes-file /tmp/release-notes.md \
-            "${{ steps.dmg.outputs.path }}" \
-            "target/zed-remote-server-macos-aarch64.gz"
+          # The tag already exists (pushed above), so this never needs to create a ref.
+          # Retried as insurance against unrelated transient API failures - each attempt
+          # is a normal request against a pre-existing tag, not a repeat of the timeout
+          # this step used to be vulnerable to.
+          for attempt in 1 2 3; do
+            if gh release create "v${version}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Zed Dev RaTeX (unofficial) ${version}" \
+              --notes-file /tmp/release-notes.md \
+              "${{ steps.dmg.outputs.path }}" \
+              "target/zed-remote-server-macos-aarch64.gz"; then
+              exit 0
+            fi
+            echo "release create failed (attempt ${attempt}/3), retrying in 30s..." >&2
+            sleep 30
+          done
+          exit 1
 
       # github.token cannot reach another repository, so mint a short-lived
       # installation token for the tap instead of storing a long-lived PAT. The
