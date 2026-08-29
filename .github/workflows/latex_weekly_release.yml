@@ -12,6 +12,12 @@ concurrency:
 permissions:
   contents: write
   pull-requests: write
+  # Creating a *new* ref (the release tag below) makes GitHub scan whether the ref
+  # touches .github/workflows/*, which needs this permission even though the tag
+  # itself never does - without it, ref creation fails with a misleading
+  # "Unable to determine if workflow can be created or updated due to timeout;
+  # `workflows` scope may be required" (reproduced 2026-08-26/27/29).
+  workflows: write
 
 jobs:
   sync-upstream:
